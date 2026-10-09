@@ -22,3 +22,8 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Local dev helpers - contain demo credentials, never commit
+/check-rewards.php
+/verify-ledger.php
+/test-api.ps1
