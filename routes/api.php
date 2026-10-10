@@ -9,6 +9,7 @@ use App\Http\Controllers\Api\AnnouncementController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\KycController;
+use App\Http\Controllers\Api\MemberDirectoryController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\ReferralController;
 use App\Http\Controllers\Api\RegistrationController;
@@ -103,6 +104,10 @@ Route::prefix('v1')->group(function () {
         Route::post('/rewards/convert', [RewardController::class, 'convert']);
 
         Route::get('/referrals', [ReferralController::class, 'index']);
+
+        /* The cooperative directory - name, number and face, nothing else. */
+        Route::get('/members', [MemberDirectoryController::class, 'index']);
+        Route::get('/members/{id}/photo', [MemberDirectoryController::class, 'photo']);
 
         Route::get('/notifications', [NotificationController::class, 'index']);
         Route::post('/notifications/read', [NotificationController::class, 'markRead']);
