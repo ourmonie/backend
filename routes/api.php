@@ -35,6 +35,14 @@ Route::prefix('v1')->group(function () {
     Route::post('/auth/register', [AuthController::class, 'register']);
     Route::post('/auth/login', [AuthController::class, 'login']);
 
+    /* Google sign-in: consent redirect, return leg, and the two hand-offs. */
+    Route::get('/auth/google/redirect', [AuthController::class, 'googleRedirect']);
+    Route::get('/auth/google/callback', [AuthController::class, 'googleCallback'])
+        ->name('auth.google.callback');
+    Route::post('/auth/google/complete', [AuthController::class, 'googleComplete']);
+    Route::post('/auth/google/profile', [AuthController::class, 'googlePendingProfile']);
+    Route::post('/auth/register/google', [AuthController::class, 'registerWithGoogle']);
+
     /* Join policy the sign-up screen adapts to, and referral lookup. */
     Route::get('/registration/settings', [RegistrationController::class, 'settings']);
     Route::post('/registration/referral/validate', [RegistrationController::class, 'validateReferral']);

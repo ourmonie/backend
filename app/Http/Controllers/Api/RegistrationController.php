@@ -27,6 +27,7 @@ class RegistrationController extends Controller
             'require_referral' => self::requireReferral(),
             'require_nin' => self::requireNin(),
             'nin_verification' => NinVerification::mode(),
+            'google_enabled' => (bool) Setting::getValue('auth.google_enabled', false),
             'min_age' => (int) Setting::getValue('registration.min_age', 18),
             'allowed_email_domains' => Setting::getValue('registration.allowed_email_domains', ['gmail.com', 'yahoo.com', 'hotmail.com']),
         ]);

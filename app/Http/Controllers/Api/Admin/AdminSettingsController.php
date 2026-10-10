@@ -37,6 +37,11 @@ class AdminSettingsController extends Controller
             'dojah_secret_key' => 'nin.dojah_secret_key',
             'dojah_sandbox' => 'nin.dojah_sandbox',
         ],
+        'auth' => [
+            'google_enabled' => 'auth.google_enabled',
+            'google_client_id' => 'auth.google_client_id',
+            'google_client_secret' => 'auth.google_client_secret',
+        ],
     ];
 
     private const RULES = [
@@ -62,6 +67,14 @@ class AdminSettingsController extends Controller
             ];
         }
 
+        if ($group === 'auth') {
+            return [
+                'google_enabled' => ['sometimes', 'boolean'],
+                'google_client_id' => ['nullable', 'string', 'max:250'],
+                'google_client_secret' => ['nullable', 'string', 'max:250'],
+            ];
+        }
+
         return self::RULES[$group];
     }
 
@@ -74,6 +87,9 @@ class AdminSettingsController extends Controller
             'group' => $group,
             'settings' => $this->serialize($group),
             'meta' => $this->meta($group),
+            // Google needs this exact value registered as an authorized
+            // redirect URI, so the screen shows it for copying.
+            'redirect_uri' => $group === 'auth' ? route('auth.google.callback') : null,
         ]);
     }
 
