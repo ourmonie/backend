@@ -21,7 +21,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpFoundation\RedirectResponse;
@@ -411,6 +413,69 @@ class AuthController extends Controller
     }
 
     /**
+     * Requirement 17 - the dashboard demands a passport photograph and will
+     * not release the member until one arrives. The picture joins the KYC
+     * documents on the private disk: an identity artefact is never exposed
+     * on a public URL, so it is fetched back through the authenticated
+     * stream below rather than /storage.
+     */
+    public function uploadPassportPhoto(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'photo' => ['required', 'file', 'mimes:jpg,jpeg,png', 'max:5120'],
+        ], [
+            'photo.mimes' => 'Choose a JPG or PNG image for your passport photograph.',
+            'photo.max' => 'The passport photograph must be smaller than 5 MB.',
+            'photo.required' => 'Choose the passport photograph you want to upload.',
+        ]);
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        $user = $request->user();
+        $file = $request->file('photo');
+        $extension = strtolower($file->getClientOriginalExtension() ?: 'jpg');
+        $path = sprintf('passport/%d-%s.%s', $user->id, Str::random(16), $extension);
+
+        Storage::disk('local')->put($path, file_get_contents($file->getRealPath()));
+
+        $previous = $user->passport_photo;
+        $user->update(['passport_photo' => $path]);
+
+        // Show the face wherever an avatar is drawn, without overwriting a
+        // picture Google brought along for the profile chip.
+        if (empty($user->avatar)) {
+            $user->update(['avatar' => $path]);
+        }
+
+        $user->member?->update(['avatar' => $path]);
+
+        if ($previous && ! str_starts_with($previous, 'http')) {
+            Storage::disk('local')->delete($previous);
+        }
+
+        return response()->json([
+            'message' => 'Passport photograph saved.',
+            'passport_photo' => $path,
+        ]);
+    }
+
+    /** Private stream for the member's own passport photograph. */
+    public function showPassportPhoto(Request $request): JsonResponse|StreamedResponse
+    {
+        $path = $request->user()->passport_photo;
+
+        // Answered directly rather than abort(404): the message is the
+        // member's, not the router's generic one.
+        if (! $path || ! Storage::disk('local')->exists($path)) {
+            return response()->json(['message' => 'No passport photograph on file yet.'], 404);
+        }
+
+        return Storage::disk('local')->response($path, 'passport-photo-'.basename($path));
+    }
+
+    /**
      * Set or change the 4-6 digit transaction PIN.
      */
     public function setTransactionPin(Request $request): JsonResponse
@@ -770,6 +835,7 @@ class AuthController extends Controller
             'permissions' => $user->permissionCodes(),
             'has_transaction_pin' => $user->transaction_pin !== null,
             'onboarded' => $user->onboarded_at !== null,
+            'passport_photo' => $user->passport_photo,
         ];
     }
 }

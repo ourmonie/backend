@@ -64,6 +64,8 @@ Route::prefix('v1')->group(function () {
         Route::get('/auth/me', [AuthController::class, 'me']);
         Route::post('/auth/logout', [AuthController::class, 'logout']);
         Route::post('/auth/onboarding/complete', [AuthController::class, 'completeOnboarding']);
+        Route::post('/auth/passport-photo', [AuthController::class, 'uploadPassportPhoto']);
+        Route::get('/auth/passport-photo', [AuthController::class, 'showPassportPhoto']);
         Route::put('/auth/pin', [AuthController::class, 'setTransactionPin']);
         Route::put('/auth/password', [AuthController::class, 'changePassword']);
 

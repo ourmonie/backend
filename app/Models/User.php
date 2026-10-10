@@ -25,6 +25,7 @@ class User extends Authenticatable
         'date_of_birth',
         'password',
         'avatar',
+        'passport_photo',
         'google_id',
         'onboarded_at',
         'transaction_pin',
