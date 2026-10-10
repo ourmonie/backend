@@ -10,13 +10,17 @@ use App\Models\User;
 use App\Services\AccountProvisioner;
 use App\Services\NinVerification;
 use App\Services\NinVerificationException;
+use App\Support\EmailTemplates;
+use App\Support\MailSettings;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
@@ -99,9 +103,11 @@ class AuthController extends Controller
             'email_verified_at' => now(),
         ]);
 
-        $this->provisionMembership($user, $data, $referrer, $code);
+        $member = $this->provisionMembership($user, $data, $referrer, $code);
 
         $user->update(['last_login_at' => now()]);
+
+        $this->sendWelcomeEmail($user, $member);
 
         return response()->json($this->sessionPayload($user), 201);
     }
@@ -308,9 +314,11 @@ class AuthController extends Controller
 
         Cache::forget("auth.google.pending.{$pending}");
 
-        $this->provisionMembership($user, $data, $referrer, $code);
+        $member = $this->provisionMembership($user, $data, $referrer, $code);
 
         $user->update(['last_login_at' => now()]);
+
+        $this->sendWelcomeEmail($user, $member);
 
         return response()->json($this->sessionPayload($user), 201);
     }
@@ -413,6 +421,127 @@ class AuthController extends Controller
         ]);
 
         return response()->json(['message' => 'Password updated.']);
+    }
+
+    /* --------------------------- Password reset --------------------------- */
+
+    /**
+     * Send a reset link. The answer is identical whether or not the address
+     * is registered, so this endpoint cannot be used to probe accounts.
+     */
+    public function forgotPassword(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => ['required', 'string', 'lowercase', 'email:rfc', 'max:190'],
+        ]);
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        if (! MailSettings::enabled()) {
+            throw ValidationException::withMessages([
+                'email' => 'Password reset is unavailable right now. Please contact support.',
+            ]);
+        }
+
+        $email = strtolower((string) $request->input('email'));
+        $user = User::where('email', $email)->first();
+
+        if ($user !== null) {
+            $token = Str::random(60);
+
+            DB::table('password_reset_tokens')->updateOrInsert(
+                ['email' => $user->email],
+                ['token' => Hash::make($token), 'created_at' => now()]
+            );
+
+            try {
+                MailSettings::send(
+                    $user->email,
+                    'Reset your password on OurMonie',
+                    EmailTemplates::resetPassword($user->name, $token, $user->email)
+                );
+            } catch (\Throwable $exception) {
+                Log::error('Password reset email failed to send.', ['error' => $exception->getMessage(), 'email' => $email]);
+
+                throw ValidationException::withMessages([
+                    'email' => 'We could not send the reset email right now. Please try again shortly.',
+                ]);
+            }
+        }
+
+        return response()->json([
+            'message' => 'If that email address is registered, a password reset link is on its way.',
+        ]);
+    }
+
+    /** Consume a reset token: set the new password and sign out every device. */
+    public function resetPassword(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => ['required', 'string', 'lowercase', 'email:rfc', 'max:190'],
+            'token' => ['required', 'string', 'max:120'],
+            'password' => ['required', 'string', 'min:8', 'regex:/^(?=.*[A-Za-z])(?=.*\d)/', 'confirmed'],
+        ], [
+            'password.regex' => 'Password must be at least 8 characters and include both letters and numbers.',
+        ]);
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        $email = strtolower((string) $request->input('email'));
+        $record = DB::table('password_reset_tokens')->where('email', $email)->first();
+
+        $valid = $record !== null
+            && Hash::check((string) $request->input('token'), (string) $record->token)
+            && Carbon::parse($record->created_at)->greaterThan(now()->subHour());
+
+        $user = $valid ? User::where('email', $email)->first() : null;
+
+        if ($user === null) {
+            throw ValidationException::withMessages([
+                'token' => ['This reset link is invalid or has expired. Request a new one.'],
+            ]);
+        }
+
+        $user->update([
+            'password' => $request->input('password'),
+            'password_changed_at' => now(),
+        ]);
+
+        // Password changed: no session anywhere may outlive it.
+        $user->tokens()->delete();
+        DB::table('password_reset_tokens')->where('email', $email)->delete();
+
+        return response()->json([
+            'message' => 'Your password has been updated. Sign in with your new password.',
+        ]);
+    }
+
+    /**
+     * Best-effort welcome email: a mail outage must never roll back a
+     * successful membership (requirement 5).
+     */
+    private function sendWelcomeEmail(User $user, Member $member): void
+    {
+        if (! MailSettings::enabled()) {
+            return;
+        }
+
+        try {
+            MailSettings::send(
+                $user->email,
+                'Welcome to OurMonie Digital Cooperative',
+                EmailTemplates::welcome($user->name, (string) $member->member_number, (string) $member->referral_code)
+            );
+        } catch (\Throwable $exception) {
+            Log::error('Welcome email failed to send.', [
+                'error' => $exception->getMessage(),
+                'user_id' => $user->id,
+            ]);
+        }
     }
 
     /**

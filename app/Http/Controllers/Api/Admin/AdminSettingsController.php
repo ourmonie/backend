@@ -5,8 +5,11 @@ namespace App\Http\Controllers\Api\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\Setting;
 use App\Services\NinVerification;
+use App\Support\EmailTemplates;
+use App\Support\MailSettings;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -42,6 +45,16 @@ class AdminSettingsController extends Controller
             'google_client_id' => 'auth.google_client_id',
             'google_client_secret' => 'auth.google_client_secret',
         ],
+        'mail' => [
+            'enabled' => 'mail.enabled',
+            'host' => 'mail.host',
+            'port' => 'mail.port',
+            'encryption' => 'mail.encryption',
+            'username' => 'mail.username',
+            'password' => 'mail.password',
+            'from_address' => 'mail.from_address',
+            'from_name' => 'mail.from_name',
+        ],
     ];
 
     private const RULES = [
@@ -75,7 +88,61 @@ class AdminSettingsController extends Controller
             ];
         }
 
+        if ($group === 'mail') {
+            return [
+                'enabled' => ['sometimes', 'boolean'],
+                'host' => ['nullable', 'string', 'max:190'],
+                'port' => ['sometimes', 'integer', 'min:1', 'max:65535'],
+                'encryption' => ['sometimes', 'string', Rule::in(['tls', 'ssl', 'none'])],
+                'username' => ['nullable', 'string', 'max:190'],
+                'password' => ['nullable', 'string', 'max:190'],
+                'from_address' => ['nullable', 'email:rfc', 'max:190'],
+                'from_name' => ['nullable', 'string', 'max:120'],
+            ];
+        }
+
         return self::RULES[$group];
+    }
+
+    /**
+     * Send a live test message through the saved settings so an admin knows
+     * the channel works before the first member depends on it.
+     */
+    public function test(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'to' => ['required', 'string', 'email:rfc', 'max:190'],
+        ]);
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        if (! MailSettings::enabled()) {
+            throw ValidationException::withMessages([
+                'to' => 'Switch outbound email on and save your settings first.',
+            ]);
+        }
+
+        try {
+            MailSettings::send(
+                (string) $request->input('to'),
+                'Your OurMonie email settings work',
+                EmailTemplates::test()
+            );
+        } catch (\Throwable $exception) {
+            // The admin is debugging their own server - the transport error
+            // is exactly what they need to see.
+            Log::warning('Admin SMTP test failed.', ['error' => $exception->getMessage()]);
+
+            throw ValidationException::withMessages([
+                'to' => 'We could not send through those settings: '.$exception->getMessage(),
+            ]);
+        }
+
+        return response()->json([
+            'message' => 'Test email sent to '.$request->input('to').'.',
+        ]);
     }
 
     /** One group, ready to bind straight to a form. */

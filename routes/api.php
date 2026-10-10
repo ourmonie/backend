@@ -35,6 +35,10 @@ Route::prefix('v1')->group(function () {
     Route::post('/auth/register', [AuthController::class, 'register']);
     Route::post('/auth/login', [AuthController::class, 'login']);
 
+    /* Password recovery, delivered over the dashboard-configured SMTP. */
+    Route::post('/auth/forgot-password', [AuthController::class, 'forgotPassword']);
+    Route::post('/auth/reset-password', [AuthController::class, 'resetPassword']);
+
     /* Google sign-in: consent redirect, return leg, and the two hand-offs. */
     Route::get('/auth/google/redirect', [AuthController::class, 'googleRedirect']);
     Route::get('/auth/google/callback', [AuthController::class, 'googleCallback'])
@@ -136,6 +140,8 @@ Route::prefix('v1')->group(function () {
             Route::get('/settings/{group}', [AdminSettingsController::class, 'show'])
                 ->middleware('permission:settings.view');
             Route::put('/settings/{group}', [AdminSettingsController::class, 'update'])
+                ->middleware('permission:settings.general');
+            Route::post('/settings/mail/test', [AdminSettingsController::class, 'test'])
                 ->middleware('permission:settings.general');
         });
     });
