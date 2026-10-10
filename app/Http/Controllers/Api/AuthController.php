@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\EmailChangeRequest;
 use App\Models\Member;
 use App\Models\Referral;
 use App\Models\Setting;
@@ -522,6 +523,210 @@ class AuthController extends Controller
         return response()->json(['message' => 'Password updated.']);
     }
 
+    /* ------------------------ Profile and sign-in details ------------------ */
+
+    /**
+     * Name and phone the member edits outright. Email and password are their
+     * own flows - changing either has to prove it is really the member, and an
+     * email change additionally has to prove control of the new mailbox.
+     */
+    public function updateProfile(Request $request): JsonResponse
+    {
+        $request->validate([
+            'name' => ['sometimes', 'string', 'min:2', 'max:120'],
+            'phone' => ['sometimes', 'nullable', 'string', 'max:20', 'regex:/^[0-9+\s()-]{7,20}$/'],
+        ], [
+            'phone.regex' => 'Enter a valid phone number, for example 08031234567.',
+        ]);
+
+        $user = $request->user();
+        $user->update($request->only(['name', 'phone']));
+
+        return response()->json([
+            'message' => 'Profile updated.',
+            'user' => $this->userPayload($user->fresh()),
+        ]);
+    }
+
+    /**
+     * Ask to move the address. Nothing on the account changes here - the row
+     * is only written once a confirmation link has gone to the NEW mailbox,
+     * which is what makes a hijacked session useless for rerouting mail.
+     */
+    public function requestEmailChange(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        // A Google-only account has no password to re-enter, so the mailbox is
+        // the only proof needed there.
+        $passwordRules = $user->google_id === null ? ['required', 'string'] : ['nullable', 'string'];
+
+        $validator = Validator::make($request->all(), [
+            'email' => ['required', 'string', 'email:rfc', 'max:190'],
+            'password' => $passwordRules,
+        ], [
+            'email.required' => 'Enter the email address you would like to use.',
+        ]);
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        $this->assertPasswordMatches($request, $user, $passwordRules[0] === 'required');
+
+        $email = strtolower(trim((string) $request->input('email')));
+
+        if ($email === strtolower((string) $user->email)) {
+            throw ValidationException::withMessages([
+                'email' => 'That is already the address on your account.',
+            ]);
+        }
+
+        // The address after the last "@" - not the last "." anywhere in the
+        // string, which would read "fresh.member@gmail.com" as "com".
+        $domain = strtolower(substr(strrchr($email, '@'), 1));
+        $allowed = array_map('strtolower', RegistrationController::allowedEmailDomains());
+
+        if (! in_array($domain, $allowed, true)) {
+            throw ValidationException::withMessages([
+                'email' => 'We can only change your address to one ending in '.implode(', ', RegistrationController::allowedEmailDomains()).'.',
+            ]);
+        }
+
+        if (User::where('email', $email)->exists()) {
+            throw ValidationException::withMessages([
+                'email' => 'That email address is already in use. If it is yours, contact support.',
+            ]);
+        }
+
+        if (! MailSettings::enabled()) {
+            throw ValidationException::withMessages([
+                'email' => 'We cannot send confirmation emails right now. Please contact support to change your address.',
+            ]);
+        }
+
+        $token = Str::random(40);
+
+        // One pending request at a time: the newest ask supersedes the last.
+        EmailChangeRequest::where('user_id', $user->id)->delete();
+
+        EmailChangeRequest::create([
+            'user_id' => $user->id,
+            'old_email' => $user->email,
+            'new_email' => $email,
+            'token_hash' => hash('sha256', $token),
+            'expires_at' => now()->addMinutes(60),
+        ]);
+
+        try {
+            MailSettings::send(
+                $email,
+                'Confirm your new OurMonie email address',
+                EmailTemplates::confirmEmailChange($user->name, $token, $email, $user->email)
+            );
+        } catch (\Throwable $exception) {
+            Log::error('Email change confirmation failed to send.', ['error' => $exception->getMessage(), 'email' => $email]);
+
+            EmailChangeRequest::where('user_id', $user->id)->delete();
+
+            throw ValidationException::withMessages([
+                'email' => 'We could not send the confirmation email right now. Please try again shortly.',
+            ]);
+        }
+
+        // The address being left behind is told too - a change nobody asked
+        // for should be visible from both mailboxes.
+        try {
+            MailSettings::send(
+                $user->email,
+                'Your OurMonie email address is being changed',
+                EmailTemplates::emailChangeNotice($user->name, $email)
+            );
+        } catch (\Throwable $exception) {
+            Log::warning('Email change notice failed to send.', ['error' => $exception->getMessage()]);
+        }
+
+        return response()->json([
+            'message' => "We sent a confirmation link to {$email}. Your current address stays active until you click it.",
+            'pending_email' => $email,
+        ]);
+    }
+
+    /**
+     * The confirmation leg. Deliberately token-only rather than session-only:
+     * the link is opened from an inbox, often on another device, and the token
+     * is the proof that the new mailbox belongs to the member.
+     */
+    public function confirmEmailChange(Request $request): JsonResponse
+    {
+        $request->validate([
+            'token' => ['required', 'string', 'max:64'],
+        ], [
+            'token.required' => 'That confirmation link is incomplete. Open it again from your email.',
+        ]);
+
+        $change = EmailChangeRequest::where('token_hash', hash('sha256', (string) $request->input('token')))->first();
+
+        if ($change === null || $change->used_at !== null || $change->expires_at->isPast()) {
+            throw ValidationException::withMessages([
+                'token' => 'That confirmation link is no longer valid. Request a new change from your profile.',
+            ]);
+        }
+
+        $user = $change->user;
+
+        if ($user === null) {
+            throw ValidationException::withMessages([
+                'token' => 'That confirmation link is no longer valid. Request a new change from your profile.',
+            ]);
+        }
+
+        // The address may have been claimed while the link sat in an inbox.
+        if (User::where('email', $change->new_email)->whereKeyNot($user->id)->exists()) {
+            $change->delete();
+
+            throw ValidationException::withMessages([
+                'token' => 'That email address is now used by another account. Please contact support.',
+            ]);
+        }
+
+        $user->update(['email' => $change->new_email]);
+        $change->update(['used_at' => now()]);
+
+        return response()->json([
+            'message' => 'Your email address has been updated. Sign in with it from now on.',
+            'email' => $user->email,
+        ]);
+    }
+
+    /** Back out of a pending change without waiting for the link to expire. */
+    public function cancelEmailChange(Request $request): JsonResponse
+    {
+        EmailChangeRequest::where('user_id', $request->user()->id)->delete();
+
+        return response()->json([
+            'message' => 'Email change cancelled. Your address has not changed.',
+        ]);
+    }
+
+    /* ------------------------------ Helpers -------------------------------- */
+
+    /** Re-entering the password guards a sensitive change on password accounts. */
+    private function assertPasswordMatches(Request $request, User $user, bool $required): void
+    {
+        if (! $required) {
+            return;
+        }
+
+        $password = (string) $request->input('password');
+
+        if ($password === '' || ! Hash::check($password, $user->password)) {
+            throw ValidationException::withMessages([
+                'password' => ['Your password is incorrect.'],
+            ]);
+        }
+    }
+
     /* --------------------------- Password reset --------------------------- */
 
     /**
@@ -836,6 +1041,11 @@ class AuthController extends Controller
             'has_transaction_pin' => $user->transaction_pin !== null,
             'onboarded' => $user->onboarded_at !== null,
             'passport_photo' => $user->passport_photo,
+            // A confirmation link is on its way here; the client shows the
+            // pending state until it is clicked or expires.
+            'pending_email' => $user->pendingEmail(),
+            // A Google-only account has no password the member could re-enter.
+            'password_login' => $user->google_id === null,
         ];
     }
 }

@@ -39,6 +39,11 @@ Route::prefix('v1')->group(function () {
     Route::post('/auth/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/auth/reset-password', [AuthController::class, 'resetPassword']);
 
+    /* Opened from an inbox, usually on another device: the mailed token is
+       the proof, so this one takes no session. */
+    Route::post('/auth/email/change/confirm', [AuthController::class, 'confirmEmailChange'])
+        ->middleware('throttle:10,1');
+
     /* Google sign-in: consent redirect, return leg, and the two hand-offs. */
     Route::get('/auth/google/redirect', [AuthController::class, 'googleRedirect']);
     Route::get('/auth/google/callback', [AuthController::class, 'googleCallback'])
@@ -68,6 +73,12 @@ Route::prefix('v1')->group(function () {
         Route::get('/auth/passport-photo', [AuthController::class, 'showPassportPhoto']);
         Route::put('/auth/pin', [AuthController::class, 'setTransactionPin']);
         Route::put('/auth/password', [AuthController::class, 'changePassword']);
+
+        /* Profile edits: name and phone outright, email after a mailed link. */
+        Route::put('/auth/profile', [AuthController::class, 'updateProfile']);
+        Route::post('/auth/email/change', [AuthController::class, 'requestEmailChange'])
+            ->middleware('throttle:5,1');
+        Route::post('/auth/email/change/cancel', [AuthController::class, 'cancelEmailChange']);
 
         Route::get('/dashboard', [DashboardController::class, 'index']);
         Route::get('/dashboard/chart', [DashboardController::class, 'chart']);

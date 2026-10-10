@@ -67,6 +67,22 @@ class User extends Authenticatable
         return $this->hasMany(MemberNotification::class);
     }
 
+    /** Every request this account has made to move its address, oldest first. */
+    public function emailChanges(): HasMany
+    {
+        return $this->hasMany(EmailChangeRequest::class);
+    }
+
+    /**
+     * The address a confirmation email is on its way to, while that request is
+     * still live. Surfaced to the client so the pending state survives a page
+     * refresh instead of looking as though the request vanished.
+     */
+    public function pendingEmail(): ?string
+    {
+        return $this->emailChanges()->live()->latest('id')->first()?->new_email;
+    }
+
     /**
      * Roles assigned to this user. Role/permission pairs live in the database
      * (PRD 31 - granular, individually configurable permissions).

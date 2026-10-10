@@ -110,6 +110,76 @@ class EmailTemplates
         );
     }
 
+    /**
+     * Sent to the NEW address. This email is the whole proof of ownership:
+     * until the link is clicked the account keeps its old address.
+     */
+    public static function confirmEmailChange(string $name, string $token, string $newEmail, string $oldEmail): string
+    {
+        $brand = self::BRAND;
+        $ink = self::INK;
+        $muted = self::MUTED;
+        $frontend = self::frontend();
+        $firstName = trim((string) preg_split('/\s+/', $name)[0]);
+        $url = $frontend.'/confirm-email-change?token='.rawurlencode($token);
+
+        return self::wrap(
+            'Confirm your new OurMonie email address',
+            <<<HTML
+            <h1 style="margin:0 0 8px;font-size:24px;line-height:1.25;color:{$ink};font-weight:800;">Confirm your new email address</h1>
+            <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:{$muted};">
+              Hello {$firstName}, you asked to change the email address on your OurMonie account to
+              <strong style="color:{$ink};">{$newEmail}</strong>. Confirm it below and it takes effect straight away.
+            </p>
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="margin:8px 0 20px;">
+              <tr>
+                <td style="border-radius:12px;background:{$brand};">
+                  <a href="{$url}" style="display:inline-block;padding:14px 28px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;">Confirm this address</a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0 0 8px;font-size:14px;line-height:1.6;color:{$muted};">
+              This link expires in <strong style="color:{$ink};">60 minutes</strong> and can be used once.
+              The button does not work? Paste this address into your browser:
+            </p>
+            <p style="margin:0 0 24px;font-size:12.5px;line-height:1.5;color:{$muted};word-break:break-all;">
+              {$url}
+            </p>
+
+            <p style="margin:0;font-size:13.5px;line-height:1.6;color:{$muted};">
+              Until you confirm, your address stays <strong style="color:{$ink};">{$oldEmail}</strong> and you keep signing in with it.
+              If you did not ask for this, ignore this email and nothing changes.
+            </p>
+            HTML
+        );
+    }
+
+    /** Sent to the CURRENT address, so a change nobody asked for is visible. */
+    public static function emailChangeNotice(string $name, string $newEmail): string
+    {
+        $ink = self::INK;
+        $muted = self::MUTED;
+        $firstName = trim((string) preg_split('/\s+/', $name)[0]);
+
+        return self::wrap(
+            'Your OurMonie email address is being changed',
+            <<<HTML
+            <h1 style="margin:0 0 8px;font-size:24px;line-height:1.25;color:{$ink};font-weight:800;">Your email address is being changed</h1>
+            <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:{$muted};">
+              Hello {$firstName}, a request was made to move the email address on your OurMonie account to
+              <strong style="color:{$ink};">{$newEmail}</strong>. It only takes effect once that address is confirmed,
+              and you keep signing in with this one until then.
+            </p>
+
+            <p style="margin:0;font-size:13.5px;line-height:1.6;color:{$muted};">
+              If this was not you, change your password from your profile straight away and contact support.
+            </p>
+            HTML
+        );
+    }
+
     public static function test(): string
     {
         $ink = self::INK;
