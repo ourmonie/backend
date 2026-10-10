@@ -10,6 +10,7 @@ use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\KycController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\ReferralController;
+use App\Http\Controllers\Api\RegistrationController;
 use App\Http\Controllers\Api\RewardController;
 use App\Http\Controllers\Api\SavingsController;
 use App\Http\Controllers\Api\TransactionController;
@@ -32,6 +33,11 @@ Route::prefix('v1')->group(function () {
 
     Route::post('/auth/register', [AuthController::class, 'register']);
     Route::post('/auth/login', [AuthController::class, 'login']);
+
+    /* Join policy the sign-up screen adapts to, and referral lookup. */
+    Route::get('/registration/settings', [RegistrationController::class, 'settings']);
+    Route::post('/registration/referral/validate', [RegistrationController::class, 'validateReferral']);
+
     Route::get('/health', fn () => response()->json([
         'status' => 'ok',
         'service' => 'ourmonie-api',

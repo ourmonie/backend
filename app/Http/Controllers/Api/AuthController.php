@@ -20,20 +20,59 @@ class AuthController extends Controller
     }
 
     /**
-     * Register, then create the permanent member account structure.
+     * Apply to join, then create the permanent member account structure.
+     *
+     * Which gates apply is decided by admin settings (seamless mode can turn
+     * referral and identity checks off) - never by the .env file.
      */
     public function register(Request $request): JsonResponse
     {
+        $requireReferral = RegistrationController::requireReferral();
+        $requireNin = RegistrationController::requireNin();
+        $minAge = RegistrationController::minAge();
+        $domains = RegistrationController::allowedEmailDomains();
+
         $validator = Validator::make($request->all(), [
             'name' => ['required', 'string', 'max:120'],
-            'email' => ['required', 'string', 'email', 'max:190', 'unique:users,email'],
+            'email' => [
+                'required', 'string', 'lowercase', 'email:rfc', 'max:190', 'unique:users,email',
+                function (string $attribute, mixed $value, callable $fail) use ($domains) {
+                    $domain = strtolower(substr(strrchr((string) $value, '@') ?: '', 1));
+
+                    if (! in_array($domain, $domains, true)) {
+                        $friendly = array_map(
+                            fn (string $host) => match (true) {
+                                str_contains($host, 'gmail') => 'Gmail',
+                                str_contains($host, 'yahoo') => 'Yahoo',
+                                str_contains($host, 'hotmail') => 'Hotmail',
+                                default => $host,
+                            },
+                            $domains
+                        );
+
+                        $fail('Use a '.implode(' or ', $friendly).' address to join. Other email providers are not accepted.');
+                    }
+                },
+            ],
             'phone' => ['required', 'string', 'max:30', 'unique:users,phone'],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
-            'referral_code' => ['nullable', 'string', 'max:20'],
+            'whatsapp' => ['required', 'string', 'max:30', 'regex:/^[0-9+\s()-]{10,20}$/', 'unique:users,whatsapp'],
+            'password' => ['required', 'string', 'min:8', 'confirmed', 'regex:/[A-Za-z]/', 'regex:/[0-9]/'],
+            'referral_code' => [$requireReferral ? 'required' : 'nullable', 'string', 'max:20'],
+            'date_of_birth' => [$requireNin ? 'required' : 'nullable', 'date', 'before_or_equal:today'],
+            'nin' => [$requireNin ? 'required' : 'nullable', 'digits:11', 'unique:users,nin'],
             'occupation' => ['nullable', 'string', 'max:100'],
             'employer' => ['nullable', 'string', 'max:150'],
             'job_title' => ['nullable', 'string', 'max:100'],
             'employment_status' => ['nullable', 'string', 'max:40'],
+        ], [
+            'referral_code.required' => 'A referral code from an existing member is required to join.',
+            'password.regex' => 'Password must be at least 8 characters and include both letters and numbers.',
+            'whatsapp.required' => 'Enter the WhatsApp number we should reach you on.',
+            'whatsapp.regex' => 'Enter a valid WhatsApp number.',
+            'nin.required' => 'Enter your National Identification Number (NIN).',
+            'nin.digits' => 'Your NIN must be exactly 11 digits.',
+            'date_of_birth.required' => 'Enter your date of birth.',
+            'date_of_birth.before_or_equal' => 'That date of birth is in the future.',
         ]);
 
         if ($validator->fails()) {
@@ -42,19 +81,42 @@ class AuthController extends Controller
 
         $data = $validator->validated();
 
+        // Age gate: adult membership only.
+        if (! empty($data['date_of_birth'])) {
+            $age = \Illuminate\Support\Carbon::parse($data['date_of_birth'])->age;
+
+            if ($age < $minAge) {
+                throw ValidationException::withMessages([
+                    'date_of_birth' => "You must be at least {$minAge} years old to join the cooperative.",
+                ]);
+            }
+        }
+
+        // The referral must belong to a real member when the gate is on.
+        $referrer = null;
+        $code = strtoupper(trim((string) ($data['referral_code'] ?? '')));
+
+        if ($code !== '') {
+            $referrer = Member::where('referral_code', $code)->first();
+
+            if ($referrer === null) {
+                throw ValidationException::withMessages([
+                    'referral_code' => 'We could not find that referral code. Check the code with the member who invited you.',
+                ]);
+            }
+        }
+
         $user = User::create([
             'name' => $data['name'],
             'email' => $data['email'],
             'phone' => $data['phone'],
+            'whatsapp' => $data['whatsapp'],
+            'nin' => $data['nin'] ?? null,
+            'date_of_birth' => $data['date_of_birth'] ?? null,
             'password' => $data['password'],
             'is_active' => true,
             'email_verified_at' => now(),
         ]);
-
-        $referrer = null;
-        if (! empty($data['referral_code'])) {
-            $referrer = Member::where('referral_code', strtoupper($data['referral_code']))->first();
-        }
 
         $member = Member::create([
             'user_id' => $user->id,
@@ -78,7 +140,7 @@ class AuthController extends Controller
                 'referrer_member_id' => $referrer->id,
                 'referee_user_id' => $user->id,
                 'referee_member_id' => $member->id,
-                'code' => $data['referral_code'],
+                'code' => $code,
                 'status' => Referral::STATUS_REGISTERED,
                 'registered_at' => now(),
             ]);
