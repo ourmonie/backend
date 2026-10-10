@@ -392,6 +392,25 @@ class AuthController extends Controller
     }
 
     /**
+     * The guided welcome screens (requirement 16) are mandatory: the member
+     * walks through all four and this stamps the account as onboarded so the
+     * app stops intercepting them. Idempotent - a reload cannot re-flag.
+     */
+    public function completeOnboarding(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        if ($user->onboarded_at === null) {
+            $user->update(['onboarded_at' => now()]);
+        }
+
+        return response()->json([
+            'message' => 'Welcome to the cooperative.',
+            'user' => $this->userPayload($user),
+        ]);
+    }
+
+    /**
      * Set or change the 4-6 digit transaction PIN.
      */
     public function setTransactionPin(Request $request): JsonResponse
@@ -750,6 +769,7 @@ class AuthController extends Controller
             'roles' => $user->roleCodes(),
             'permissions' => $user->permissionCodes(),
             'has_transaction_pin' => $user->transaction_pin !== null,
+            'onboarded' => $user->onboarded_at !== null,
         ];
     }
 }
