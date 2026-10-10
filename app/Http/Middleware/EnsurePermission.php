@@ -24,7 +24,7 @@ class EnsurePermission
         $user = $request->user();
 
         if (! $user) {
-            return response()->json(['message' => 'Unauthenticated.'], 401);
+            return response()->json(['message' => 'Your session has expired. Please sign in again.'], 401);
         }
 
         $abilities = array_values(array_filter($abilities));

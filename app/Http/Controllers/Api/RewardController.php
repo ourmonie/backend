@@ -104,7 +104,7 @@ class RewardController extends Controller
         $points = (int) $request->input('points');
 
         if ($points > (int) $account->points_balance) {
-            throw ValidationException::withMessages(['points' => ['You do not have that many points.']]);
+            throw ValidationException::withMessages(['points' => ['You do not have enough points for that conversion.']]);
         }
 
         // Value is derived from the conversion tiers, never hardcoded.
@@ -112,7 +112,7 @@ class RewardController extends Controller
         $cash = round($fullValue * ($points / max(1, (int) $account->points_balance)), 2);
 
         if ($cash <= 0) {
-            throw ValidationException::withMessages(['points' => ['These points do not convert to a positive amount yet.']]);
+            throw ValidationException::withMessages(['points' => ['That amount is too small to convert. Choose a higher amount.']]);
         }
 
         $transaction = DB::transaction(function () use ($account, $member, $points, $cash) {

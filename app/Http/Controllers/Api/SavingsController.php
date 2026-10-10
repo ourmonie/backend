@@ -155,7 +155,7 @@ class SavingsController extends Controller
         $member = $request->user()->member;
 
         if ($member->hasBlockingHold()) {
-            throw ValidationException::withMessages(['account' => ['Your account is suspended.']]);
+            throw ValidationException::withMessages(['account' => ['Your account is suspended. Please contact support.']]);
         }
 
         $product = SavingsProduct::where('code', $request->input('product'))

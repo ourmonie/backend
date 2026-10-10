@@ -44,10 +44,16 @@ class AuthController extends Controller
         $requireNin = RegistrationController::requireNin();
         $domains = RegistrationController::allowedEmailDomains();
 
+        // Members type addresses however they like - normalise before the
+        // rules run so the account always stores a lowercased email (15).
+        if (is_string($request->input('email'))) {
+            $request->merge(['email' => strtolower(trim($request->input('email')))]);
+        }
+
         $validator = Validator::make($request->all(), [
             'name' => ['required', 'string', 'max:120'],
             'email' => [
-                'required', 'string', 'lowercase', 'email:rfc', 'max:190', 'unique:users,email',
+                'required', 'string', 'email:rfc', 'max:190', 'unique:users,email',
                 function (string $attribute, mixed $value, callable $fail) use ($domains) {
                     $domain = strtolower(substr(strrchr((string) $value, '@') ?: '', 1));
 
@@ -328,6 +334,13 @@ class AuthController extends Controller
      */
     public function login(Request $request): JsonResponse
     {
+        // Same rule the rest of the world follows: trim it, and lowercase
+        // the address half so case never decides who gets in (15).
+        if (is_string($request->input('login'))) {
+            $login = trim($request->input('login'));
+            $request->merge(['login' => str_contains($login, '@') ? strtolower($login) : $login]);
+        }
+
         $validator = Validator::make($request->all(), [
             'login' => ['required', 'string'],
             'password' => ['required', 'string'],
@@ -344,7 +357,7 @@ class AuthController extends Controller
 
         if ($user === null || ! Hash::check($request->input('password'), $user->password)) {
             throw ValidationException::withMessages([
-                'login' => ['The provided credentials do not match our records.'],
+                'login' => ['Incorrect email or password. Check your details and try again.'],
             ]);
         }
 
@@ -391,7 +404,7 @@ class AuthController extends Controller
         $user = $request->user();
 
         if (! Hash::check($request->input('password'), $user->password)) {
-            throw ValidationException::withMessages(['password' => ['Password is incorrect.']]);
+            throw ValidationException::withMessages(['password' => ['Your password is incorrect.']]);
         }
 
         $user->update(['transaction_pin' => bcrypt($request->input('pin'))]);
@@ -406,13 +419,15 @@ class AuthController extends Controller
     {
         $request->validate([
             'current_password' => ['required', 'string'],
-            'password' => ['required', 'string', 'min:8', 'confirmed'],
+            'password' => ['required', 'string', 'min:8', 'confirmed', 'regex:/[A-Za-z]/', 'regex:/[0-9]/'],
+        ], [
+            'password.regex' => 'Password must be at least 8 characters and include both letters and numbers.',
         ]);
 
         $user = $request->user();
 
         if (! Hash::check($request->input('current_password'), $user->password)) {
-            throw ValidationException::withMessages(['current_password' => ['Current password is incorrect.']]);
+            throw ValidationException::withMessages(['current_password' => ['Your current password is incorrect.']]);
         }
 
         $user->update([
@@ -432,7 +447,7 @@ class AuthController extends Controller
     public function forgotPassword(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'email' => ['required', 'string', 'lowercase', 'email:rfc', 'max:190'],
+            'email' => ['required', 'string', 'email:rfc', 'max:190'],
         ]);
 
         if ($validator->fails()) {
@@ -480,7 +495,7 @@ class AuthController extends Controller
     public function resetPassword(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'email' => ['required', 'string', 'lowercase', 'email:rfc', 'max:190'],
+            'email' => ['required', 'string', 'email:rfc', 'max:190'],
             'token' => ['required', 'string', 'max:120'],
             'password' => ['required', 'string', 'min:8', 'regex:/^(?=.*[A-Za-z])(?=.*\d)/', 'confirmed'],
         ], [

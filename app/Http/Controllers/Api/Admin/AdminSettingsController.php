@@ -164,6 +164,17 @@ class AdminSettingsController extends Controller
     {
         $this->guard($group);
 
+        // Domain lists are typed by hand - trim and lowercase them before
+        // the rules run, so "Gmail.COM" simply saves as "gmail.com".
+        if (is_array($request->input('allowed_email_domains'))) {
+            $request->merge([
+                'allowed_email_domains' => array_values(array_filter(array_map(
+                    fn ($domain) => is_string($domain) ? strtolower(trim($domain)) : $domain,
+                    $request->input('allowed_email_domains')
+                ))),
+            ]);
+        }
+
         $validator = Validator::make($request->all(), $this->rules($group));
 
         if ($validator->fails()) {

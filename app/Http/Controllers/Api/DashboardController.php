@@ -21,7 +21,7 @@ class DashboardController extends Controller
         $member = $request->user()->member;
 
         if ($member === null) {
-            return response()->json(['message' => 'No member profile found.'], 404);
+            return response()->json(['message' => 'We could not find your member profile. Please contact support.'], 404);
         }
 
         $member->load(['accounts', 'wallet.account', 'rewardAccount', 'tier']);
