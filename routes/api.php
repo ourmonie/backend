@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\Admin\AdminDashboardController;
 use App\Http\Controllers\Api\Admin\AdminKycController;
 use App\Http\Controllers\Api\Admin\AdminMemberController;
 use App\Http\Controllers\Api\Admin\AdminRoleController;
+use App\Http\Controllers\Api\Admin\AdminSettingsController;
 use App\Http\Controllers\Api\AnnouncementController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\DashboardController;
@@ -122,6 +123,12 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:role.manage');
             Route::put('/users/{userId}/roles', [AdminRoleController::class, 'assignUserRoles'])
                 ->middleware('permission:role.manage');
+
+            /* Dashboard-editable policy: registration gates and identity checks. */
+            Route::get('/settings/{group}', [AdminSettingsController::class, 'show'])
+                ->middleware('permission:settings.view');
+            Route::put('/settings/{group}', [AdminSettingsController::class, 'update'])
+                ->middleware('permission:settings.general');
         });
     });
 });

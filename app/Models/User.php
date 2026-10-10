@@ -17,9 +17,16 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'email',
+        'email_verified_at',
         'phone',
+        'whatsapp',
+        'nin',
+        'nin_verified_at',
+        'date_of_birth',
         'password',
         'avatar',
+        'google_id',
+        'onboarded_at',
         'transaction_pin',
         'is_admin',
         'is_active',
@@ -31,6 +38,7 @@ class User extends Authenticatable
         'password',
         'remember_token',
         'transaction_pin',
+        'nin',
     ];
 
     protected function casts(): array
@@ -39,6 +47,9 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'last_login_at' => 'datetime',
             'password_changed_at' => 'datetime',
+            'nin_verified_at' => 'datetime',
+            'onboarded_at' => 'datetime',
+            'date_of_birth' => 'date',
             'password' => 'hashed',
             'is_admin' => 'boolean',
             'is_active' => 'boolean',

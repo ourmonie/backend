@@ -1,0 +1,148 @@
+<?php
+
+namespace App\Http\Controllers\Api\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Models\Setting;
+use App\Services\NinVerification;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+
+/**
+ * Dashboard-editable configuration (PRD 31). Every rule that gates a member
+ * - referral, identity, accepted email providers - and the credentials behind
+ * the checks are stored in the settings table and edited here. Nothing in
+ * this system is configured through the .env file.
+ *
+ * GET renders a group; PUT writes only the keys that group declares, so a
+ * crafted payload can never poison an unrelated setting.
+ */
+class AdminSettingsController extends Controller
+{
+    /** Short field name => full settings key, per group. */
+    private const FIELDS = [
+        'registration' => [
+            'seamless' => 'registration.seamless',
+            'require_referral' => 'registration.require_referral',
+            'require_nin' => 'registration.require_nin',
+            'min_age' => 'registration.min_age',
+            'allowed_email_domains' => 'registration.allowed_email_domains',
+        ],
+        'nin' => [
+            'mode' => 'nin.mode',
+            'dojah_app_id' => 'nin.dojah_app_id',
+            'dojah_secret_key' => 'nin.dojah_secret_key',
+            'dojah_sandbox' => 'nin.dojah_sandbox',
+        ],
+    ];
+
+    private const RULES = [
+        'registration' => [
+            'seamless' => ['sometimes', 'boolean'],
+            'require_referral' => ['sometimes', 'boolean'],
+            'require_nin' => ['sometimes', 'boolean'],
+            'min_age' => ['sometimes', 'integer', 'min:18', 'max:100'],
+            'allowed_email_domains' => ['sometimes', 'array', 'min:1', 'max:20'],
+            'allowed_email_domains.*' => ['string', 'max:60', 'lowercase'],
+        ],
+    ];
+
+    /** Rule sets that need a runtime expression cannot be constants. */
+    private function rules(string $group): array
+    {
+        if ($group === 'nin') {
+            return [
+                'mode' => ['sometimes', 'string', Rule::in([NinVerification::MODE_MANUAL, NinVerification::MODE_DOJAH])],
+                'dojah_app_id' => ['nullable', 'string', 'max:120'],
+                'dojah_secret_key' => ['nullable', 'string', 'max:200'],
+                'dojah_sandbox' => ['sometimes', 'boolean'],
+            ];
+        }
+
+        return self::RULES[$group];
+    }
+
+    /** One group, ready to bind straight to a form. */
+    public function show(string $group): JsonResponse
+    {
+        $this->guard($group);
+
+        return response()->json([
+            'group' => $group,
+            'settings' => $this->serialize($group),
+            'meta' => $this->meta($group),
+        ]);
+    }
+
+    public function update(Request $request, string $group): JsonResponse
+    {
+        $this->guard($group);
+
+        $validator = Validator::make($request->all(), $this->rules($group));
+
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        $payload = $request->all();
+
+        foreach (self::FIELDS[$group] as $field => $key) {
+            if (! array_key_exists($field, $payload)) {
+                continue;
+            }
+
+            $value = $payload[$field];
+
+            // Booleans arrive from the form as true/false; store the canonical
+            // representation the settings reader expects.
+            if (is_bool($value)) {
+                $value = $value ? '1' : '0';
+            }
+
+            Setting::put($key, $value, $group);
+        }
+
+        return response()->json([
+            'message' => 'Settings saved.',
+            'group' => $group,
+            'settings' => $this->serialize($group),
+        ]);
+    }
+
+    /* ------------------------------ Helpers ------------------------------ */
+
+    private function guard(string $group): void
+    {
+        abort_unless(array_key_exists($group, self::FIELDS), 404);
+    }
+
+    /** Short-keyed, correctly typed values plus their labels for the UI. */
+    private function serialize(string $group): array
+    {
+        $values = [];
+
+        foreach (self::FIELDS[$group] as $field => $key) {
+            $setting = Setting::where('key', $key)->first();
+
+            $values[$field] = $setting === null ? null : Setting::typecast($setting);
+        }
+
+        return $values;
+    }
+
+    private function meta(string $group): array
+    {
+        return Setting::whereIn('key', array_values(self::FIELDS[$group]))
+            ->get()
+            ->mapWithKeys(fn (Setting $setting) => [
+                str_replace($setting->group.'.', '', $setting->key) => [
+                    'label' => $setting->label,
+                    'description' => $setting->description,
+                ],
+            ])
+            ->all();
+    }
+}

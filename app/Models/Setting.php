@@ -31,6 +31,12 @@ class Setting extends Model
             return $default;
         }
 
+        return static::typecast($setting);
+    }
+
+    /** The stored string, interpreted through the setting's declared type. */
+    public static function typecast(self $setting): mixed
+    {
         return match ($setting->type) {
             'integer' => (int) $setting->value,
             'decimal' => (float) $setting->value,

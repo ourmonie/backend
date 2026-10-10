@@ -7,8 +7,11 @@ use App\Models\Member;
 use App\Models\Referral;
 use App\Models\User;
 use App\Services\AccountProvisioner;
+use App\Services\NinVerification;
+use App\Services\NinVerificationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
@@ -58,7 +61,9 @@ class AuthController extends Controller
             'whatsapp' => ['required', 'string', 'max:30', 'regex:/^[0-9+\s()-]{10,20}$/', 'unique:users,whatsapp'],
             'password' => ['required', 'string', 'min:8', 'confirmed', 'regex:/[A-Za-z]/', 'regex:/[0-9]/'],
             'referral_code' => [$requireReferral ? 'required' : 'nullable', 'string', 'max:20'],
-            'date_of_birth' => [$requireNin ? 'required' : 'nullable', 'date', 'before_or_equal:today'],
+            // With live NIN verification the date of birth comes from NIMC,
+            // so the form does not ask for it; manual mode still does.
+            'date_of_birth' => [$requireNin && ! NinVerification::isLive() ? 'required' : 'nullable', 'date', 'before_or_equal:today'],
             'nin' => [$requireNin ? 'required' : 'nullable', 'digits:11', 'unique:users,nin'],
             'occupation' => ['nullable', 'string', 'max:100'],
             'employer' => ['nullable', 'string', 'max:150'],
@@ -80,16 +85,29 @@ class AuthController extends Controller
         }
 
         $data = $validator->validated();
+        $verifyNin = $requireNin && NinVerification::isLive();
+        $dateOfBirth = $data['date_of_birth'] ?? null;
 
-        // Age gate: adult membership only.
-        if (! empty($data['date_of_birth'])) {
-            $age = \Illuminate\Support\Carbon::parse($data['date_of_birth'])->age;
+        // Age gate: adult membership only. Live verification reads the date
+        // of birth from NIMC; manual mode trusts the declared one.
+        if ($verifyNin) {
+            try {
+                $record = app(NinVerification::class)->verify((string) $data['nin']);
+            } catch (NinVerificationException $exception) {
+                throw ValidationException::withMessages(['nin' => $exception->getMessage()]);
+            }
 
-            if ($age < $minAge) {
+            $dateOfBirth = $record['date_of_birth'];
+
+            if (Carbon::parse($dateOfBirth)->age < $minAge) {
                 throw ValidationException::withMessages([
-                    'date_of_birth' => "You must be at least {$minAge} years old to join the cooperative.",
+                    'nin' => "Members must be at least {$minAge} years old. This NIN belongs to someone under {$minAge}.",
                 ]);
             }
+        } elseif (! empty($dateOfBirth) && Carbon::parse($dateOfBirth)->age < $minAge) {
+            throw ValidationException::withMessages([
+                'date_of_birth' => "You must be at least {$minAge} years old to join the cooperative.",
+            ]);
         }
 
         // The referral must belong to a real member when the gate is on.
@@ -112,7 +130,8 @@ class AuthController extends Controller
             'phone' => $data['phone'],
             'whatsapp' => $data['whatsapp'],
             'nin' => $data['nin'] ?? null,
-            'date_of_birth' => $data['date_of_birth'] ?? null,
+            'date_of_birth' => $dateOfBirth,
+            'nin_verified_at' => $verifyNin ? now() : null,
             'password' => $data['password'],
             'is_active' => true,
             'email_verified_at' => now(),

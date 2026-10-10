@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Member;
 use App\Models\Setting;
+use App\Services\NinVerification;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
@@ -25,6 +26,7 @@ class RegistrationController extends Controller
         return response()->json([
             'require_referral' => self::requireReferral(),
             'require_nin' => self::requireNin(),
+            'nin_verification' => NinVerification::mode(),
             'min_age' => (int) Setting::getValue('registration.min_age', 18),
             'allowed_email_domains' => Setting::getValue('registration.allowed_email_domains', ['gmail.com', 'yahoo.com', 'hotmail.com']),
         ]);
