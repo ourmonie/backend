@@ -102,9 +102,14 @@ Route::prefix('v1')->group(function () {
         Route::get('/dashboard/chart', [DashboardController::class, 'chart']);
 
         Route::get('/wallet', [WalletController::class, 'show']);
+        Route::get('/banks', [WalletController::class, 'banks']);
         Route::post('/wallet/funding/status', [WalletController::class, 'fundingStatus']);
         Route::post('/wallet/allocate', [WalletController::class, 'allocate']);
-        Route::post('/wallet/withdraw', [WalletController::class, 'withdraw']);
+
+        /* Money leaves here, behind a PIN. The ceiling is low enough that
+           guessing a 4-digit PIN is not a viable strategy. */
+        Route::post('/wallet/withdraw', [WalletController::class, 'withdraw'])
+            ->middleware('throttle:5,1');
 
         Route::get('/transactions', [TransactionController::class, 'index']);
         Route::get('/transactions/{reference}', [TransactionController::class, 'show']);

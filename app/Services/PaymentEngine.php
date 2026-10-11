@@ -32,6 +32,7 @@ class PaymentEngine
     public function __construct(
         private readonly WalletService $walletService,
         private readonly DedicatedAccountService $dedicatedAccounts,
+        private readonly \App\Services\Gateways\PayoutService $payouts,
     ) {
     }
 
@@ -148,10 +149,18 @@ class PaymentEngine
     /* ---------------------------------------------------------------------- */
 
     /**
-     * Settle a completed transfer (payout) against our records.
+     * Settle an outbound transfer against our records.
      *
      * Called from the transfer.success / transfer.failed webhook so an
      * outbound payment stops sitting in `processing`.
+     *
+     * A payout that the bank did not accept is the dangerous half of this
+     * job. The member has already been debited, so leaving the transaction
+     * merely marked `failed` would quietly keep their money. The debit is
+     * therefore handed back through `reversePayout`, which posts a real
+     * reversing entry rather than editing a balance.
+     *
+     * @return array{status:string,message:string,event:?PaymentEvent}
      */
     public function handleTransferResult(string $eventId, string $reference, string $outcome, array $payload): array
     {
@@ -171,28 +180,129 @@ class PaymentEngine
             return $this->close($event, PaymentEvent::STATUS_IGNORED, 'Unknown transfer reference.');
         }
 
-        $status = $outcome === 'success'
-            ? Transaction::STATUS_COMPLETED
-            : Transaction::STATUS_FAILED;
+        // Already settled. A provider retry, or a second notification for
+        // the same transfer, must not move money a second time.
+        if (in_array($transaction->status, [
+            Transaction::STATUS_COMPLETED,
+            Transaction::STATUS_REVERSED,
+            Transaction::STATUS_FAILED,
+        ], true)) {
+            return $this->close(
+                $event,
+                PaymentEvent::STATUS_DUPLICATE,
+                'Transfer already settled as '.$transaction->status.'.'
+            );
+        }
 
-        $transaction->forceFill([
-            'status' => $status,
-            'meta' => array_merge((array) $transaction->meta, [
-                'provider_transfer' => $payload,
-            ]),
-        ])->save();
+        $meta = (array) $transaction->meta;
+        $settled = $this->readTransferOutcome(
+            $meta['gateway'] ?? null,
+            $transaction->provider_reference ?? $meta['transfer_code'] ?? null,
+            $outcome,
+            $payload
+        );
+
+        if ($settled === 'success') {
+            $transaction->forceFill([
+                'status' => Transaction::STATUS_COMPLETED,
+                'meta' => array_merge($meta, [
+                    'provider_transfer' => $payload,
+                    'settled_at' => now()->toIso8601String(),
+                ]),
+            ])->save();
+
+            $event->forceFill([
+                'status' => PaymentEvent::STATUS_PROCESSED,
+                'transaction_id' => $transaction->id,
+                'processed_at' => now(),
+            ])->save();
+
+            return [
+                'status' => PaymentEvent::STATUS_PROCESSED,
+                'message' => 'Transfer completed.',
+                'event' => $event,
+            ];
+        }
+
+        $reversal = $this->walletService->reversePayout(
+            $transaction,
+            'The bank did not accept this transfer, so the money was returned to your account.'
+        );
+
+        $transaction->refresh();
 
         $event->forceFill([
             'status' => PaymentEvent::STATUS_PROCESSED,
             'transaction_id' => $transaction->id,
             'processed_at' => now(),
+            'error' => 'Transfer did not settle: '.$settled,
         ])->save();
+
+        if ($reversal !== null && $transaction->member !== null) {
+            $this->notifyReversal($transaction->member, $transaction);
+        }
 
         return [
             'status' => PaymentEvent::STATUS_PROCESSED,
-            'message' => 'Transfer marked '.$status.'.',
+            'message' => 'Transfer did not settle; funds returned.',
             'event' => $event,
         ];
+    }
+
+    /**
+     * What the provider says became of the transfer.
+     *
+     * The notification is re-read against the provider rather than trusted,
+     * the same way an inbound credit is. The signature has already been
+     * checked, so when the re-read itself cannot be completed the signed
+     * notification is believed - a provider that says a payout failed is
+     * describing money that did not reach the member, and acting on that is
+     * recoverable where leaving it stranded is not.
+     *
+     * @return string success|failed
+     */
+    private function readTransferOutcome(?string $gateway, ?string $transferCode, string $claimed, array $payload): string
+    {
+        if ($gateway !== null && $transferCode !== null && $transferCode !== '') {
+            try {
+                $transfer = $this->payouts->status($gateway, $transferCode);
+                $status = strtolower((string) ($transfer['status'] ?? ''));
+
+                if (in_array($status, ['success', 'successful', 'completed'], true)) {
+                    return 'success';
+                }
+
+                if (in_array($status, ['failed', 'reversed', 'abandoned', 'cancelled'], true)) {
+                    return 'failed';
+                }
+
+                // Still pending at the provider. Nothing to settle yet - the
+                // next notification will carry the outcome.
+                return $this->normaliseOutcome($claimed, $payload);
+            } catch (\Throwable $exception) {
+                report($exception);
+            }
+        }
+
+        return $this->normaliseOutcome($claimed, $payload);
+    }
+
+    /**
+     * Fall back to what the signed notification itself claimed.
+     */
+    private function normaliseOutcome(string $claimed, array $payload): string
+    {
+        $status = strtolower((string) ($payload['data']['status'] ?? ''));
+
+        if (in_array($status, ['success', 'successful', 'completed'], true)) {
+            return 'success';
+        }
+
+        if (in_array($status, ['failed', 'reversed', 'abandoned', 'cancelled'], true)) {
+            return 'failed';
+        }
+
+        return $claimed === 'success' ? 'success' : 'failed';
     }
 
     /* ---------------------------------------------------------------------- */
@@ -363,6 +473,32 @@ class PaymentEngine
         return (float) $member->accounts()
             ->where('type', \App\Models\MemberAccount::TYPE_WALLET)
             ->value('balance');
+    }
+
+    /**
+     * Tell the member their money came back.
+     *
+     * A failed payout is the one case where silence costs a member real
+     * trust: their balance went down and nothing arrived.
+     */
+    private function notifyReversal(Member $member, Transaction $transaction): void
+    {
+        try {
+            Notifier::notify(
+                $member,
+                'withdrawal.returned',
+                'Withdrawal returned',
+                sprintf(
+                    'Your withdrawal of ₦%s did not reach the bank, so the money has been returned to your account.',
+                    number_format((float) $transaction->amount, 2)
+                ),
+                'warning',
+                '/app/transactions',
+                ['reference' => $transaction->reference]
+            );
+        } catch (\Throwable $exception) {
+            report($exception);
+        }
     }
 
     /**

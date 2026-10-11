@@ -8,9 +8,14 @@ use App\Models\Transaction;
 use App\Services\AccountProvisioner;
 use App\Services\DedicatedAccountService;
 use App\Services\Gateways\GatewayConfig;
+use App\Services\Gateways\GatewayException;
+use App\Services\Gateways\FlutterwaveGateway;
+use App\Services\Gateways\PaystackGateway;
+use App\Services\Gateways\PayoutService;
 use App\Services\WalletService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
@@ -212,15 +217,69 @@ class WalletController extends Controller
     }
 
     /**
+     * The banks a withdrawal can be sent to.
+     *
+     * Served from whichever gateway is active so the member picks from the
+     * provider's own directory rather than typing a name. That is what gives
+     * the withdrawal a bank code, which is what makes verifying the
+     * destination account possible in the first place - a free-text bank
+     * name carries nothing a provider can resolve against.
+     */
+    public function banks(): JsonResponse
+    {
+        $gateway = GatewayConfig::activeGateway();
+
+        if ($gateway === null) {
+            return response()->json(['banks' => []]);
+        }
+
+        $banks = Cache::remember('payout.banks.'.$gateway, now()->addDay(), function () use ($gateway) {
+            $rows = $gateway === GatewayConfig::FLUTTERWAVE
+                ? app(FlutterwaveGateway::class)->banks()
+                : app(PaystackGateway::class)->banks();
+
+            return collect($rows)
+                ->map(fn (array $bank) => [
+                    'code' => (string) ($bank['code'] ?? ''),
+                    'name' => (string) ($bank['name'] ?? ''),
+                ])
+                ->filter(fn (array $bank) => $bank['code'] !== '' && $bank['name'] !== '')
+                ->unique('code')
+                ->sortBy('name')
+                ->values()
+                ->all();
+        });
+
+        return response()->json(['banks' => $banks]);
+    }
+
+    /**
      * Withdraw to a Nigerian bank account, applying the configured fee.
+     *
+     * Money only leaves by a real provider transfer. The order of operations
+     * is what makes it safe to fail at any point:
+     *
+     *   1. The destination is name-enumerated against the bank BEFORE the
+     *      member is debited, so a mistyped account number costs nothing.
+     *   2. The member is debited as `processing`, not `completed`. Their
+     *      money is held down so it cannot be spent again while the transfer
+     *      is in flight, but nothing here claims the payout succeeded.
+     *   3. The provider transfer is initiated against that same reference.
+     *   4. If initiation fails, the debit is reversed before the member is
+     *      told anything.
+     *
+     * Completion is not this endpoint's business. The provider confirms it
+     * by webhook, and until then the withdrawal is honestly shown as
+     * processing.
      */
     public function withdraw(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
             'account_number' => ['required', 'string', 'digits:10'],
+            'bank_code' => ['required', 'string', 'max:20'],
             'bank_name' => ['required', 'string', 'max:80'],
             'account_name' => ['required', 'string', 'max:120'],
-            'amount' => ['required', 'numeric', 'min:100'],
+            'amount' => ['required', 'numeric', 'min:100', 'max:5000000'],
             'source' => ['nullable', 'in:wallet,swift_save,quest_save,time_vault'],
             'pin' => ['required', 'string', 'digits:4,6'],
         ]);
@@ -232,43 +291,120 @@ class WalletController extends Controller
         $member = $request->user()->member;
         $this->guard($member, $request, 'withdrawal_restriction');
 
+        // Nothing is debited until a rail is actually available to carry the
+        // money. Taking a balance and then discovering there is no gateway
+        // would strand the member.
+        $gateway = GatewayConfig::activeGateway();
+
+        if ($gateway === null) {
+            throw ValidationException::withMessages([
+                'amount' => ['Withdrawals are temporarily unavailable. Please try again shortly.'],
+            ]);
+        }
+
         $this->verifyPin($request);
 
         $source = $request->input('source', MemberAccount::TYPE_WALLET);
         $account = $this->provisioner->accountFor($member, $source);
 
-        $fee = $this->resolveFee($member, (float) $request->input('amount'));
-        $total = (float) $request->input('amount') + $fee;
-
-        if ((float) $account->balance < $total) {
-            throw ValidationException::withMessages([
-                'amount' => sprintf(
-                    'Insufficient balance. You have ₦%s available and ₦%s will be deducted including fees.',
-                    number_format((float) $account->balance, 2),
-                    number_format($total, 2)
-                ),
-            ]);
-        }
+        $amount = round((float) $request->input('amount'), 2);
+        $fee = $this->resolveFee($member, $amount);
+        $total = round($amount + $fee, 2);
 
         if (! $account->isAvailable()) {
             throw ValidationException::withMessages(['source' => ['This account is not available for withdrawals.']]);
         }
 
+        // The balance and the spendable balance are not the same figure for
+        // a TimeVault. Money locked until maturity cannot be withdrawn early.
+        $available = $this->walletService->availableBalance($member, $source);
+        $locked = round((float) $account->balance - $available, 2);
+
+        if ($available < $total) {
+            throw ValidationException::withMessages([
+                'amount' => $locked > 0
+                    ? sprintf(
+                        '₦%s of this account is locked in a TimeVault that has not matured. ₦%s is available to withdraw.',
+                        number_format($locked, 2),
+                        number_format($available, 2)
+                    )
+                    : sprintf(
+                        'Insufficient balance. You have ₦%s available and ₦%s will be deducted including fees.',
+                        number_format($available, 2),
+                        number_format($total, 2)
+                    ),
+            ]);
+        }
+
+        try {
+            // Confirms the account number resolves to the name given, at the
+            // bank. The single check that stops a withdrawal reaching a
+            // stranger because a digit was mistyped.
+            $destination = app(PayoutService::class)->resolve(
+                $gateway,
+                $request->input('account_number'),
+                $request->input('bank_code'),
+                $request->input('account_name'),
+            );
+        } catch (GatewayException $exception) {
+            throw ValidationException::withMessages(['account_number' => $exception->getMessage()]);
+        }
+
+        $reference = Transaction::generateReference('WD');
+
         $transaction = $this->walletService->withdraw(
             $member,
             $source,
-            (float) $request->input('amount'),
+            $amount,
             $fee,
-            trim($request->input('account_name').' - '.$request->input('bank_name')),
+            trim($destination['name'].' - '.$request->input('bank_name')),
+            null,
+            'Withdrawal to bank account',
+            Transaction::STATUS_PROCESSING,
+            $reference,
         );
 
+        try {
+            $transfer = app(PayoutService::class)->send(
+                $gateway,
+                $destination,
+                $amount,
+                $reference,
+                'OurMonie withdrawal '.$reference,
+            );
+        } catch (GatewayException $exception) {
+            // The provider refused, so the debit never represented money
+            // that left. Hand it back now rather than leaving the member
+            // short while someone notices.
+            $this->walletService->reversePayout($transaction, 'Provider declined the transfer: '.$exception->getMessage());
+
+            throw ValidationException::withMessages([
+                'amount' => 'Your withdrawal could not be sent and your balance has been restored. '.$exception->getMessage(),
+            ]);
+        }
+
+        $transaction->forceFill([
+            'provider_reference' => $transfer['transfer_code'],
+            'meta' => array_merge((array) $transaction->meta, [
+                'gateway' => $transfer['provider'],
+                'transfer_code' => $transfer['transfer_code'],
+                'gateway_status' => $transfer['status'],
+                'destination' => [
+                    'account_number' => $destination['account_number'],
+                    'account_name' => $destination['name'],
+                    'bank_name' => $destination['bank_name'],
+                ],
+            ]),
+        ])->save();
+
         return response()->json([
-            'message' => 'Withdrawal submitted.',
+            'message' => 'Withdrawal submitted and being processed.',
             'reference' => $transaction->reference,
-            'amount' => (float) $request->input('amount'),
+            'amount' => $amount,
             'fee' => $fee,
+            'status' => $transaction->status,
             'balance' => round((float) $member->accounts()->where('type', $source)->value('balance'), 2),
-        ], 201);
+        ], 202);
     }
 
     /* ------------------------------- helpers -------------------------------- */

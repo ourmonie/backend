@@ -8,6 +8,7 @@ use App\Models\MemberAccount;
 use App\Models\SavingsGoal;
 use App\Models\SavingsVault;
 use App\Models\Transaction;
+use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 
 /**
@@ -148,11 +149,48 @@ class WalletService
     /* ---------------------------------------------------------------------- */
 
     /**
+     * How much of a product account can actually leave right now.
+     *
+     * A TimeVault balance is not the member's to spend. The account balance
+     * includes principal that is contractually locked until maturity, so the
+     * headline figure is not the spendable one - and treating it as such
+     * would let a member withdraw money they agreed to set aside.
+     */
+    public function availableBalance(Member $member, string $type): float
+    {
+        $account = $this->provisioner->accountFor($member, $type);
+        $balance = round((float) $account->balance, 2);
+
+        if ($type !== MemberAccount::TYPE_VAULT || $balance <= 0) {
+            return $balance;
+        }
+
+        // Principal sitting in a pot that has not yet matured. A matured pot
+        // is the member's again whether or not they have collected it.
+        $locked = round((float) SavingsVault::where('member_account_id', $account->id)
+            ->whereNull('withdrawn_at')
+            ->where(function ($query) {
+                $query->whereNull('matures_on')
+                    ->orWhere('matures_on', '>', now()->toDateString());
+            })
+            ->sum('principal'), 2);
+
+        return round(max(0, $balance - $locked), 2);
+    }
+
+    /**
      * Pay out to a Nigerian bank account.
      *
      * Dr source member account (principal + fee)
      * Cr Cash at Bank          (principal)
      * Cr Fee Income            (fee)
+     *
+     * The money is taken from the member the moment the request is accepted,
+     * not when the provider confirms it. That is deliberate: a withdrawal
+     * still sitting in `processing` is a live claim on a balance, and if the
+     * balance were left intact the same money could be spent a second time
+     * before the first transfer settled. Anything that does not settle is
+     * handed back by `reversePayout`.
      */
     public function withdraw(
         Member $member,
@@ -162,6 +200,8 @@ class WalletService
         ?string $beneficiary = null,
         ?string $providerReference = null,
         string $description = 'Withdrawal to bank account',
+        string $status = Transaction::STATUS_COMPLETED,
+        ?string $reference = null,
     ): Transaction {
         $from = $this->provisioner->accountFor($member, $fromType);
 
@@ -175,7 +215,69 @@ class WalletService
             $providerReference,
             $description,
             'internal',
+            $status,
+            $reference,
         );
+    }
+
+    /**
+     * Hand a payout back to the member because it never reached their bank.
+     *
+     * This is the mirror image of `withdraw` and posts through the same
+     * double-entry path, so a returned withdrawal is visible in the books as
+     * a real movement rather than a balance quietly edited back up.
+     *
+     * Idempotent by construction. The transaction row is locked and only a
+     * payout still in `processing` is reversed, so a provider that retries
+     * its failure notification - or two webhooks arriving together - cannot
+     * credit the member twice.
+     */
+    public function reversePayout(Transaction $transaction, string $reason): ?Transaction
+    {
+        return DB::transaction(function () use ($transaction, $reason) {
+            $locked = Transaction::whereKey($transaction->id)->lockForUpdate()->first();
+
+            if ($locked === null || $locked->status !== Transaction::STATUS_PROCESSING) {
+                return null;
+            }
+
+            $account = $locked->account;
+
+            if ($account === null) {
+                return null;
+            }
+
+            $amount = round((float) $locked->amount, 2);
+            $fee = round((float) $locked->fee_amount, 2);
+
+            $reversal = $this->ledger->post([
+                'type' => Transaction::REVERSAL,
+                'member_id' => $locked->member_id,
+                'member_account_id' => $account->id,
+                'amount' => $amount,
+                'fee_amount' => 0,
+                'channel' => 'bank_transfer',
+                'source' => 'system',
+                'description' => $reason,
+                'counterparty' => $locked->counterparty,
+                'occurred_at' => now(),
+                'lines' => [
+                    ['account' => LedgerAccount::CASH_AT_BANK, 'debit' => $amount, 'memo' => 'Returned payout'],
+                    ['member_account_id' => $account->id, 'credit' => round($amount + $fee, 2), 'memo' => 'Withdrawal returned'],
+                ],
+            ]);
+
+            $locked->forceFill([
+                'status' => Transaction::STATUS_REVERSED,
+                'meta' => array_merge((array) $locked->meta, [
+                    'reversed_at' => now()->toIso8601String(),
+                    'reversal_reason' => $reason,
+                    'reversal_reference' => $reversal->reference,
+                ]),
+            ])->save();
+
+            return $reversal;
+        });
     }
 
     /**
@@ -250,6 +352,8 @@ class WalletService
         ?string $providerReference,
         string $description,
         string $source,
+        string $status = Transaction::STATUS_COMPLETED,
+        ?string $reference = null,
     ): Transaction {
         $lines = [
             ['member_account_id' => $from->id, 'debit' => $totalDebit, 'memo' => 'Withdrawal'],
@@ -261,6 +365,7 @@ class WalletService
         }
 
         return $this->ledger->post([
+            'reference' => $reference,
             'type' => $from->type === MemberAccount::TYPE_WALLET
                 ? Transaction::WALLET_WITHDRAWAL
                 : Transaction::SAVINGS_WITHDRAWAL,
@@ -268,6 +373,7 @@ class WalletService
             'member_account_id' => $from->id,
             'amount' => $amount,
             'fee_amount' => $fee,
+            'status' => $status,
             'channel' => 'bank_transfer',
             'source' => $source,
             'description' => $description,

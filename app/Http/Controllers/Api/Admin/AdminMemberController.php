@@ -443,6 +443,25 @@ class AdminMemberController extends Controller
             ]);
         }
 
+        // Money locked in an un-matured TimeVault is not the member's to
+        // release, and an administrator closing an account is not a reason
+        // to break that promise either.
+        $lockedVault = round(
+            (float) $member->accounts()->where('type', \App\Models\MemberAccount::TYPE_VAULT)->value('balance')
+            - app(WalletService::class)->availableBalance($member, \App\Models\MemberAccount::TYPE_VAULT),
+            2
+        );
+
+        if ($lockedVault > 0) {
+            throw ValidationException::withMessages([
+                'account_number' => sprintf(
+                    '%s has ₦%s locked in a TimeVault that has not matured. Locked funds cannot be settled early.',
+                    $member->member_number,
+                    number_format($lockedVault, 2)
+                ),
+            ]);
+        }
+
         try {
             // Name-enumerated against the provider's own directory before a
             // cent moves. A mistyped account number is caught here rather
