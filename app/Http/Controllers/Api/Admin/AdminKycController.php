@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Api\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\KycRecord;
 use App\Services\Auditor;
+use App\Models\Setting;
+use App\Services\DedicatedAccountService;
 use App\Services\Notifier;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -245,7 +247,7 @@ class AdminKycController extends Controller
                 $member->approved_by = $member->approved_by ?? $actor->id;
 
                 // PRD 2 - an approved KYC is what makes a member bonafide.
-                if ((bool) \App\Models\Setting::getValue('require_kyc_for_activation', false)
+                if ((bool) Setting::getValue('require_kyc_for_activation', false)
                     && $member->membership_status === 'pending') {
                     $member->membership_status = 'active';
                 }
@@ -267,6 +269,14 @@ class AdminKycController extends Controller
             $record,
         );
 
+        // PRD 87-91 - a verified member is entitled to a dedicated account
+        // number. Issued after the decision commits, never inside it: the
+        // provider call must not hold the review transaction open, and a
+        // slow bank must not roll back an approval that already happened.
+        if ($recordStatus === KycRecord::STATUS_VERIFIED) {
+            $this->issueDedicatedAccount($member);
+        }
+
         return response()->json([
             'message' => match ($validated['decision']) {
                 'approve' => 'KYC approved.',
@@ -279,5 +289,19 @@ class AdminKycController extends Controller
                 'kyc_level' => (int) $member->fresh()->kyc_level,
             ],
         ]);
+    }
+
+    /**
+     * Best effort by design: if no gateway is active, or the provider is
+     * slow, the approval still stands and the number is issued on the next
+     * wallet load instead. Never surfaces a provider error to the reviewer.
+     */
+    private function issueDedicatedAccount(\App\Models\Member $member): void
+    {
+        try {
+            app(DedicatedAccountService::class)->assign($member);
+        } catch (\Throwable $exception) {
+            report($exception);
+        }
     }
 }

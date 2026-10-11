@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use App\Models\MemberAccount;
 use App\Models\Transaction;
 use App\Services\AccountProvisioner;
+use App\Services\DedicatedAccountService;
+use App\Services\Gateways\GatewayConfig;
 use App\Services\WalletService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -18,6 +20,7 @@ class WalletController extends Controller
     public function __construct(
         private readonly WalletService $walletService,
         private readonly AccountProvisioner $provisioner,
+        private readonly DedicatedAccountService $dedicatedAccounts,
     ) {
     }
 
@@ -25,13 +28,31 @@ class WalletController extends Controller
     {
         $member = $request->user()->member->load(['accounts', 'wallet.account']);
 
+        // PRD 87-91 - the number is issued by the gateway once a rail is live
+        // and the member is verified. Best effort: a slow provider never
+        // breaks this screen, it just means the member sees the same number
+        // again next time and the assignment retries.
+        $this->dedicatedAccounts->assign($member);
+        $member->unsetRelation('wallet')->load('wallet');
+
         $wallet = $member->accounts->firstWhere('type', MemberAccount::TYPE_WALLET);
+        $gateway = GatewayConfig::activeGateway();
 
         return response()->json([
             'account_number' => $member->wallet?->account_number,
             'account_name' => $member->wallet?->account_name ?? $member->user?->name,
             'bank_name' => $member->wallet?->bank_name ?? 'OurMonie',
             'provider' => $member->wallet?->provider,
+            'account_status' => $member->wallet?->status ?? 'unassigned',
+            'assignment_pending' => (bool) ($member->wallet?->meta['assignment_pending'] ?? false),
+            'funding' => [
+                'available' => $gateway !== null,
+                'gateway' => $gateway,
+                'method' => 'bank_transfer',
+                'instruction' => $gateway === null
+                    ? 'Bank transfer is not configured yet. Contact support to fund your wallet.'
+                    : 'Transfer to the account number above. Your wallet is credited once the transfer lands.',
+            ],
             'balance' => round((float) $wallet?->balance, 2),
             'currency' => 'NGN',
             'status' => $wallet?->status,
@@ -51,18 +72,21 @@ class WalletController extends Controller
     }
 
     /**
-     * Record an inbound transfer to the member's dedicated account number.
+     * Confirm a bank transfer the member says they have sent.
      *
-     * In production this arrives as a Paystack transfer-success webhook. The
-     * `reference` is supplied by the provider, so LedgerService treats a
-     * replay of the same event as a no-op and the wallet can never be
-     * credited twice for one real transfer.
+     * PRD 21/45 - this endpoint NEVER credits anyone. It reads provider state
+     * and returns what the provider says. Money only ever enters the ledger
+     * through PaymentEngine, from a signed webhook that was re-verified
+     * against the provider's own record before a kobo moved.
+     *
+     * It exists for one reason: a webhook can be slow, and a member staring
+     * at a wallet that has not moved yet needs an answer. Re-asking Paystack
+     * to look for the transfer (requery) is the supported way to hurry it.
      */
-    public function fund(Request $request): JsonResponse
+    public function fundingStatus(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'amount' => ['required', 'numeric', 'min:100'],
-            'reference' => ['nullable', 'string', 'max:80'],
+            'reference' => ['required', 'string', 'max:80'],
         ]);
 
         if ($validator->fails()) {
@@ -72,54 +96,75 @@ class WalletController extends Controller
         $member = $request->user()->member;
         $this->guard($member, $request, 'funding_restriction');
 
-        $amount = round((float) $request->input('amount'), 2);
-        $reference = $request->input('reference') ?: 'DVA'.strtoupper(bin2hex(random_bytes(5)));
+        $reference = trim($request->input('reference'));
 
-        $limit = \App\Models\TransactionLimit::resolve(
-            'wallet_funding',
-            (int) $member->kyc_level,
-            $member->membership_tier_id,
-        );
+        $recorded = Transaction::where('member_id', $member->id)
+            ->where('type', Transaction::WALLET_FUNDING)
+            ->where(function ($query) use ($reference) {
+                $query->where('reference', $reference)
+                    ->orWhere('provider_reference', $reference);
+            })
+            ->first();
 
-        if ($limit?->daily_limit !== null) {
-            $usedToday = (float) Transaction::where('member_id', $member->id)
-                ->where('type', Transaction::WALLET_FUNDING)
-                ->where('status', '!=', Transaction::STATUS_FAILED)
-                ->where('occurred_at', '>=', now()->startOfDay())
-                ->sum('amount');
-
-            if ($usedToday + $amount > (float) $limit->daily_limit) {
-                throw ValidationException::withMessages([
-                    'amount' => sprintf(
-                        'This would exceed your daily wallet funding limit of ₦%s.',
-                        number_format((float) $limit->daily_limit, 2)
-                    ),
-                ]);
-            }
+        if ($recorded !== null && $recorded->status === Transaction::STATUS_COMPLETED) {
+            return response()->json([
+                'settled' => true,
+                'message' => sprintf(
+                    '%s is already in your wallet.',
+                    number_format((float) $recorded->amount, 2)
+                ),
+                'reference' => $recorded->reference,
+                'amount' => round((float) $recorded->amount, 2),
+                'balance' => $this->balanceOf($member, MemberAccount::TYPE_WALLET),
+            ]);
         }
 
-        $before = round((float) $member->accounts()
-            ->where('type', MemberAccount::TYPE_WALLET)->value('balance'), 2);
-
-        // The credit and the provider settlement are one atomic step, so a
-        // failure can never leave the float half-cleared. Both postings are
-        // reference-idempotent, so a retry completes or no-ops safely.
-        [$transaction, $wallet] = DB::transaction(fn () => [
-            $this->walletService->fundWallet($member, $amount, $reference),
-            $this->walletService->settleFromProvider($amount, $reference),
-        ]);
+        // Nothing recorded yet - ask the provider to look for it, and let the
+        // signed webhook do the crediting when it finds one.
+        $requery = $this->requeryProvider($member);
 
         return response()->json([
-            'message' => $transaction->wasRecentlyCreated
-                ? sprintf('%s credited to your wallet.', number_format($amount, 2))
-                : 'This transfer was already recorded.',
-            'reference' => $transaction->reference,
-            'amount' => $amount,
-            'balance_before' => $before,
-            'balance' => round((float) $member->accounts()
-                ->where('type', MemberAccount::TYPE_WALLET)->value('balance'), 2),
-            'settled_reference' => $wallet->reference,
-        ], $transaction->wasRecentlyCreated ? 201 : 200);
+            'settled' => false,
+            'message' => $requery['message'],
+            'balance' => $this->balanceOf($member, MemberAccount::TYPE_WALLET),
+            'checked_at' => now()->toIso8601String(),
+        ], 202);
+    }
+
+    /**
+     * Ask the active gateway to re-scan the member's dedicated account for
+     * transfers it has not told us about yet. Returns false when no gateway
+     * is configured - the screen still works, it just has nothing to ask.
+     */
+    private function requeryProvider($member): array
+    {
+        $wallet = $member->wallet()->first();
+
+        if ($wallet === null || $wallet->provider_reference === null) {
+            return ['message' => 'We have not received a transfer on this account yet. It can take a few minutes.'];
+        }
+
+        $gateway = GatewayConfig::activeGateway();
+
+        if ($gateway !== GatewayConfig::PAYSTACK) {
+            return ['message' => 'We have not received a transfer on this account yet. It can take a few minutes.'];
+        }
+
+        try {
+            \App\Services\Gateways\PaystackGateway::make()
+                ->requeryDedicatedAccount($wallet->account_number);
+
+            return ['message' => 'We asked the bank to re-check. Any transfer on this account will be credited shortly.'];
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            return ['message' => 'We have not received a transfer on this account yet. It can take a few minutes.'];
+        }
+    }
+
+    private function balanceOf($member, string $type): float
+    {
+        return round((float) $member->accounts()->where('type', $type)->value('balance'), 2);
     }
 
     /**

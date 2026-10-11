@@ -3,6 +3,7 @@
 use App\Http\Controllers\Api\Admin\AdminDashboardController;
 use App\Http\Controllers\Api\Admin\AdminKycController;
 use App\Http\Controllers\Api\Admin\AdminMemberController;
+use App\Http\Controllers\Api\Admin\AdminPaymentGatewayController;
 use App\Http\Controllers\Api\Admin\AdminRoleController;
 use App\Http\Controllers\Api\Admin\AdminSettingsController;
 use App\Http\Controllers\Api\AnnouncementController;
@@ -11,6 +12,7 @@ use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\KycController;
 use App\Http\Controllers\Api\MemberDirectoryController;
 use App\Http\Controllers\Api\NotificationController;
+use App\Http\Controllers\Api\PaymentWebhookController;
 use App\Http\Controllers\Api\ReferralController;
 use App\Http\Controllers\Api\RegistrationController;
 use App\Http\Controllers\Api\RewardController;
@@ -63,6 +65,21 @@ Route::prefix('v1')->group(function () {
         'time' => now()->toIso8601String(),
     ]));
 
+    /* --------------------------- Provider rails --------------------------- */
+
+    /* Public by necessity: the providers call these with no session of ours.
+       Authenticity is the signature, and every handler verifies it before it
+       trusts a byte of the body. No throttle - providers retry on non-200
+       and a dropped retry means a member's money never lands. */
+    Route::post('/webhooks/paystack', [PaymentWebhookController::class, 'paystack'])
+        ->name('webhooks.paystack');
+    Route::post('/webhooks/flutterwave', [PaymentWebhookController::class, 'flutterwave'])
+        ->name('webhooks.flutterwave');
+
+    /* Public so the branding the dashboard edits reaches an unauthenticated
+       visitor. Design tokens only - never a credential. */
+    Route::get('/public/settings', [\App\Http\Controllers\Api\PublicSettingsController::class, 'index']);
+
     /* --------------------------- Authenticated --------------------------- */
 
     Route::middleware('auth:sanctum')->group(function () {
@@ -85,7 +102,7 @@ Route::prefix('v1')->group(function () {
         Route::get('/dashboard/chart', [DashboardController::class, 'chart']);
 
         Route::get('/wallet', [WalletController::class, 'show']);
-        Route::post('/wallet/fund', [WalletController::class, 'fund']);
+        Route::post('/wallet/funding/status', [WalletController::class, 'fundingStatus']);
         Route::post('/wallet/allocate', [WalletController::class, 'allocate']);
         Route::post('/wallet/withdraw', [WalletController::class, 'withdraw']);
 
@@ -168,6 +185,15 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:settings.general');
             Route::post('/settings/mail/test', [AdminSettingsController::class, 'test'])
                 ->middleware('permission:settings.general');
+
+            /* PRD 21 - the payment rails: readiness, key verification and
+               issuing a member their dedicated account number. */
+            Route::get('/payments', [AdminPaymentGatewayController::class, 'index'])
+                ->middleware('permission:settings.view');
+            Route::post('/payments/test', [AdminPaymentGatewayController::class, 'test'])
+                ->middleware('permission:settings.general');
+            Route::post('/payments/members/{id}/assign-account', [AdminPaymentGatewayController::class, 'assignAccount'])
+                ->middleware('permission:member.manage');
         });
     });
 });

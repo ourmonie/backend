@@ -55,6 +55,45 @@ class AdminSettingsController extends Controller
             'from_address' => 'mail.from_address',
             'from_name' => 'mail.from_name',
         ],
+        'general' => [
+            'app_name' => 'general.app_name',
+            'tagline' => 'general.tagline',
+            'footer_text' => 'general.footer_text',
+            'support_email' => 'general.support_email',
+            'support_phone' => 'general.support_phone',
+        ],
+        'branding' => [
+            'logo_url' => 'branding.logo_url',
+            'favicon_url' => 'branding.favicon_url',
+            'seo_title' => 'branding.seo_title',
+            'seo_description' => 'branding.seo_description',
+            'theme_color' => 'branding.theme_color',
+            'font_family' => 'branding.font_family',
+            'spacing_scale' => 'branding.spacing_scale',
+            'maintenance_mode' => 'branding.maintenance_mode',
+            'maintenance_message' => 'branding.maintenance_message',
+        ],
+        'paystack' => [
+            'enabled' => 'paystack.enabled',
+            'mode' => 'paystack.mode',
+            'test_public_key' => 'paystack.test_public_key',
+            'test_secret_key' => 'paystack.test_secret_key',
+            'test_webhook_secret' => 'paystack.test_webhook_secret',
+            'live_public_key' => 'paystack.live_public_key',
+            'live_secret_key' => 'paystack.live_secret_key',
+            'live_webhook_secret' => 'paystack.live_webhook_secret',
+            'preferred_bank' => 'paystack.preferred_bank',
+        ],
+        'flutterwave' => [
+            'enabled' => 'flutterwave.enabled',
+            'mode' => 'flutterwave.mode',
+            'test_public_key' => 'flutterwave.test_public_key',
+            'test_secret_key' => 'flutterwave.test_secret_key',
+            'test_webhook_hash' => 'flutterwave.test_webhook_hash',
+            'live_public_key' => 'flutterwave.live_public_key',
+            'live_secret_key' => 'flutterwave.live_secret_key',
+            'live_webhook_hash' => 'flutterwave.live_webhook_hash',
+        ],
     ];
 
     private const RULES = [
@@ -69,8 +108,7 @@ class AdminSettingsController extends Controller
     ];
 
     /** Rule sets that need a runtime expression cannot be constants. */
-    private function rules(string $group): array
-    {
+    private function rules(string $group): array    {
         if ($group === 'nin') {
             return [
                 'mode' => ['sometimes', 'string', Rule::in([NinVerification::MODE_MANUAL, NinVerification::MODE_DOJAH])],
@@ -101,7 +139,63 @@ class AdminSettingsController extends Controller
             ];
         }
 
+        if ($group === 'general') {
+            return [
+                'app_name' => ['sometimes', 'string', 'max:60'],
+                'tagline' => ['sometimes', 'string', 'max:120'],
+                'footer_text' => ['sometimes', 'string', 'max:200'],
+                'support_email' => ['sometimes', 'nullable', 'email:rfc', 'max:190'],
+                'support_phone' => ['sometimes', 'nullable', 'string', 'max:30'],
+            ];
+        }
+
+        if ($group === 'branding') {
+            return [
+                'logo_url' => ['sometimes', 'nullable', 'url:http,https', 'max:300'],
+                'favicon_url' => ['sometimes', 'nullable', 'url:http,https', 'max:300'],
+                'seo_title' => ['sometimes', 'string', 'max:70'],
+                'seo_description' => ['sometimes', 'string', 'max:170'],
+                'theme_color' => ['sometimes', 'string', 'regex:/^#[0-9a-fA-F]{6}$/'],
+                'font_family' => ['sometimes', 'string', Rule::in(['satoshi', 'inter', 'system'])],
+                'spacing_scale' => ['sometimes', 'string', Rule::in(['compact', 'comfortable', 'relaxed'])],
+                'maintenance_mode' => ['sometimes', 'boolean'],
+                'maintenance_message' => ['sometimes', 'string', 'max:200'],
+            ];
+        }
+
+        if ($group === 'paystack') {
+            return $this->gatewayRules('paystack');
+        }
+
+        if ($group === 'flutterwave') {
+            return $this->gatewayRules('flutterwave');
+        }
+
         return self::RULES[$group];
+    }
+
+    /**
+     * Both gateways share one shape: an on/off, an environment, and two
+     * complete key sets. `mode` is constrained to the two environments so a
+     * crafted payload can never point the server at an unrecognised one, and
+     * every key is optional - a gateway may be saved half-configured and
+     * switched on only once both halves are there.
+     */
+    private function gatewayRules(string $gateway): array
+    {
+        $suffix = $gateway === 'paystack' ? 'webhook_secret' : 'webhook_hash';
+
+        return [
+            'enabled' => ['sometimes', 'boolean'],
+            'mode' => ['sometimes', 'string', Rule::in(['test', 'live'])],
+            'test_public_key' => ['nullable', 'string', 'max:120'],
+            'test_secret_key' => ['nullable', 'string', 'max:120'],
+            'test_'.$suffix => ['nullable', 'string', 'max:120'],
+            'live_public_key' => ['nullable', 'string', 'max:120'],
+            'live_secret_key' => ['nullable', 'string', 'max:120'],
+            'live_'.$suffix => ['nullable', 'string', 'max:120'],
+            'preferred_bank' => ['nullable', 'string', 'max:60'],
+        ];
     }
 
     /**
@@ -190,6 +284,23 @@ class AdminSettingsController extends Controller
 
             $value = $payload[$field];
 
+            // Secrets leave the server masked. The form sends that same
+            // masked string back untouched when the admin did not retype the
+            // key, and writing it would destroy the real value - so it is
+            // recognised and dropped here instead. An empty string still
+            // clears the key deliberately.
+            if (self::isSecret($key) && is_string($value)) {
+                if ($value === $this->maskSecret($this->raw($key))) {
+                    continue;
+                }
+
+                if ($value === '') {
+                    Setting::put($key, null, $group);
+
+                    continue;
+                }
+            }
+
             // Booleans arrive from the form as true/false; store the canonical
             // representation the settings reader expects.
             if (is_bool($value)) {
@@ -197,6 +308,12 @@ class AdminSettingsController extends Controller
             }
 
             Setting::put($key, $value, $group);
+        }
+
+        // Switching an environment or pasting a key must be reflected in the
+        // readiness the Payments screen reads immediately after saving.
+        if (in_array($group, ['paystack', 'flutterwave'], true)) {
+            $this->reportGatewayReady($group);
         }
 
         return response()->json([
@@ -219,12 +336,76 @@ class AdminSettingsController extends Controller
         $values = [];
 
         foreach (self::FIELDS[$group] as $field => $key) {
+            $raw = $this->raw($key);
+
+            if (self::isSecret($key)) {
+                // Only a hint of the key ever crosses the wire.
+                $values[$field] = $raw === null ? null : $this->maskSecret($raw);
+                $values[$field.'_set'] = $raw !== null && $raw !== '';
+
+                continue;
+            }
+
             $setting = Setting::where('key', $key)->first();
 
             $values[$field] = $setting === null ? null : Setting::typecast($setting);
         }
 
         return $values;
+    }
+
+    private function raw(string $key): ?string
+    {
+        $setting = Setting::where('key', $key)->first();
+
+        return $setting === null ? null : (string) $setting->value;
+    }
+
+    /**
+     * A key the dashboard must never echo back in full. Pattern-matched
+     * rather than enumerated so a credential added later is protected by
+     * default rather than by remembering to list it.
+     */
+    private static function isSecret(string $key): bool
+    {
+        return str_ends_with($key, '_secret_key')
+            || str_ends_with($key, '_webhook_secret')
+            || str_ends_with($key, '_webhook_hash')
+            || str_ends_with($key, '.password')
+            || str_ends_with($key, '.client_secret')
+            || str_ends_with($key, '.dojah_secret_key');
+    }
+
+    /** sk_live_abcdef123456 -> sk_live_…3456 */
+    private function maskSecret(string $value): string
+    {
+        if ($value === '') {
+            return '';
+        }
+
+        if (strlen($value) <= 8) {
+            return str_repeat('•', strlen($value));
+        }
+
+        return substr($value, 0, 7).'…'.substr($value, -4);
+    }
+
+    /**
+     * Tell the admin plainly whether the environment they just saved can
+     * actually sign a request, so "activated" never means "half filled in".
+     */
+    private function reportGatewayReady(string $gateway): void
+    {
+        $mode = (string) Setting::getValue($gateway.'.mode', 'test');
+        $secret = (string) Setting::getValue($gateway.'.'.$mode.'_secret_key', '');
+
+        if ($secret !== '' && ! (bool) Setting::getValue($gateway.'.enabled', false)) {
+            // Not an error: keys can be staged before the switch is thrown.
+            Log::info('Gateway keys saved but gateway is still disabled.', [
+                'gateway' => $gateway,
+                'mode' => $mode,
+            ]);
+        }
     }
 
     private function meta(string $group): array
