@@ -154,6 +154,8 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:member.manage');
             Route::delete('/members/{id}', [AdminMemberController::class, 'destroy'])
                 ->middleware('permission:member.manage');
+            Route::post('/members/{id}/sweep', [AdminMemberController::class, 'sweepBalance'])
+                ->middleware('permission:member.manage');
             Route::post('/members/{id}/holds', [AdminMemberController::class, 'storeHold'])
                 ->middleware('permission:wallet.hold');
             Route::delete('/members/{id}/holds/{holdId}', [AdminMemberController::class, 'releaseHold'])

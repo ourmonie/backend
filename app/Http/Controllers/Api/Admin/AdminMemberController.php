@@ -6,10 +6,15 @@ use App\Http\Controllers\Controller;
 use App\Models\AccountHold;
 use App\Models\Member;
 use App\Services\Auditor;
+use App\Services\Gateways\GatewayConfig;
+use App\Services\Gateways\GatewayException;
+use App\Services\Gateways\PayoutService;
 use App\Services\Notifier;
+use App\Services\WalletService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Validation\Rule;
 
 /**
@@ -296,15 +301,16 @@ class AdminMemberController extends Controller
     {
         $member = Member::with('user')->findOrFail($id);
 
-        $balance = (float) $member->accounts()->sum('balance');
+        $balance = round((float) $member->accounts()->sum('balance'), 2);
 
         if ($balance > 0) {
             return response()->json([
                 'message' => sprintf(
-                    'Cannot delete %s: ₦%s is still held across their accounts. Sweep the balances to zero first.',
+                    '%s still holds ₦%s. Settle it to a bank account before deleting them - nothing can be removed while there is a live balance.',
                     $member->member_number,
                     number_format($balance, 2)
                 ),
+                'balance' => $balance,
             ], 422);
         }
 
@@ -394,6 +400,120 @@ class AdminMemberController extends Controller
             'deleted' => $deleted,
             'skipped' => $skipped,
         ]);
+    }
+
+    /**
+     * Pay a member's whole position out to a bank account, leaving them at
+     * zero so they can then be deleted.
+     *
+     * This is the only sanctioned way for a balance to leave the ledger, and
+     * it is deliberately not an editing operation. There is no code path
+     * anywhere that sets a balance, so there is no way to make a member
+     * deletable by quietly zeroing their accounts - the money has to
+     * actually go somewhere a bank can confirm.
+     *
+     * The gateway moves the funds first and the ledger is only updated once
+     * a transfer identifier comes back, so a gateway that fails mid-flight
+     * leaves the balance untouched and recoverable rather than vanished.
+     */
+    public function sweepBalance(Request $request, int $id): JsonResponse
+    {
+        $member = Member::with('user')->findOrFail($id);
+
+        $validated = $request->validate([
+            'account_number' => ['required', 'string', 'digits:10'],
+            'account_name' => ['required', 'string', 'max:120'],
+            'bank_code' => ['required', 'string', 'max:20'],
+            'bank_name' => ['required', 'string', 'max:80'],
+        ]);
+
+        $balance = round((float) $member->accounts()->sum('balance'), 2);
+
+        if ($balance <= 0) {
+            throw ValidationException::withMessages([
+                'account_number' => $member->member_number.' has no balance to settle.',
+            ]);
+        }
+
+        $gateway = GatewayConfig::activeGateway();
+
+        if ($gateway === null) {
+            throw ValidationException::withMessages([
+                'account_number' => 'No payment gateway is switched on with a saved key, so there is nowhere to send the money. Turn one on under Settings, Payments first.',
+            ]);
+        }
+
+        try {
+            // Name-enumerated against the provider's own directory before a
+            // cent moves. A mistyped account number is caught here rather
+            // than after the money is gone.
+            $destination = app(PayoutService::class)->resolve(
+                $gateway,
+                $validated['account_number'],
+                $validated['bank_code'],
+                $validated['account_name'],
+            );
+
+            $transfer = app(PayoutService::class)->send(
+                $gateway,
+                $destination,
+                $balance,
+                'SWEEP-'.$member->member_number.'-'.now()->format('YmdHis'),
+                'Settlement of balance on member closure',
+            );
+        } catch (GatewayException $exception) {
+            throw ValidationException::withMessages([
+                'account_number' => $exception->getMessage(),
+            ]);
+        }
+
+        // Only now that the provider holds a real transfer do we empty the
+        // accounts, through the same posting every withdrawal goes through.
+        $swept = app(WalletService::class)->sweepMemberBalance($member, [
+            'account_number' => $destination['account_number'],
+            'bank_name' => $validated['bank_name'],
+            'account_name' => $destination['name'],
+        ]);
+
+        Auditor::record(
+            'member.balance_swept',
+            'member',
+            '₦'.number_format($swept['total'], 2).' settled to '.$validated['bank_name']
+                .' ****'.substr($validated['account_number'], -4).' for '.$member->member_number,
+            ['gateway' => $gateway, 'transfer_code' => $transfer['transfer_code'], 'status' => $transfer['status']],
+            ['total' => $swept['total'], 'account_count' => count($swept['transactions'])],
+            $member,
+        );
+
+        Notifier::notify(
+            $member,
+            'account',
+            'Balance settled',
+            'Your balance of ₦'.number_format($swept['total'], 2).' has been paid to your bank account.',
+            'info',
+        );
+
+        return response()->json([
+            'message' => sprintf(
+                '₦%s settled to %s. %s can now be deleted.',
+                number_format($swept['total'], 2),
+                $validated['bank_name'],
+                $member->member_number
+            ),
+            'amount' => $swept['total'],
+            'account_count' => count($swept['transactions']),
+            'balance' => round((float) $member->accounts()->sum('balance'), 2),
+            'transfer' => [
+                'provider' => $gateway,
+                'transfer_code' => $transfer['transfer_code'],
+                'status' => $transfer['status'],
+            ],
+            'accounts' => $swept['transactions']->map(fn ($account) => [
+                'type' => $account->type,
+                'label' => $account->label(),
+                'balance' => (float) $account->balance,
+            ]),
+        ], 201);
     }
 
     /**

@@ -161,12 +161,98 @@ class WalletService
         float $fee = 0,
         ?string $beneficiary = null,
         ?string $providerReference = null,
+        string $description = 'Withdrawal to bank account',
     ): Transaction {
         $from = $this->provisioner->accountFor($member, $fromType);
-        $total = round($amount + $fee, 2);
 
+        return $this->postPayout(
+            $member,
+            $from,
+            round($amount + $fee, 2),
+            $amount,
+            $fee,
+            $beneficiary,
+            $providerReference,
+            $description,
+            'internal',
+        );
+    }
+
+    /**
+     * Empty every product account a member holds, in one direction.
+     *
+     * Used when a member is being closed out and their position has to be
+     * paid to a real bank account. Each account is settled through the
+     * same posting every ordinary withdrawal goes through, so a swept
+     * member leaves an identical audit trail - there is no privileged path
+     * that could quietly remove money from the books.
+     *
+     * Accounts are taken most liquid first, so a shortfall in a locked
+     * TimeVault can never strand a wallet balance already paid out.
+     *
+     * @param  array<string, string>  $destination  account_number, bank_name, account_name
+     * @return array{transactions: array<int, MemberAccount>, total: float}
+     */
+    public function sweepMemberBalance(Member $member, array $destination): array
+    {
+        $accounts = $member->accounts()
+            ->where('balance', '>', 0)
+            ->orderByRaw(
+                'FIELD(type, ?, ?, ?, ?)',
+                [MemberAccount::TYPE_WALLET, MemberAccount::TYPE_SWIFT, MemberAccount::TYPE_QUEST, MemberAccount::TYPE_VAULT]
+            )
+            ->get();
+
+        $beneficiary = trim($destination['account_name'].' - '.$destination['bank_name']);
+        $statements = [];
+        $total = 0.0;
+
+        foreach ($accounts as $account) {
+            $amount = round((float) $account->balance, 2);
+
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $this->postPayout(
+                $member,
+                $account,
+                $amount,
+                $amount,
+                0,
+                $beneficiary,
+                null,
+                'Balance settled on member closure',
+                'admin',
+            );
+
+            $statements[] = $account->refresh();
+            $total = round($total + $amount, 2);
+        }
+
+        return ['transactions' => $statements, 'total' => $total];
+    }
+
+    /**
+     * One payout posting, shared by member withdrawals and admin sweeps.
+     *
+     * Dr source account (principal + fee)
+     * Cr Cash at Bank            (principal)
+     * Cr Fee Income              (fee, when charged)
+     */
+    private function postPayout(
+        Member $member,
+        MemberAccount $from,
+        float $totalDebit,
+        float $amount,
+        float $fee,
+        ?string $beneficiary,
+        ?string $providerReference,
+        string $description,
+        string $source,
+    ): Transaction {
         $lines = [
-            ['member_account_id' => $from->id, 'debit' => $total, 'memo' => 'Withdrawal'],
+            ['member_account_id' => $from->id, 'debit' => $totalDebit, 'memo' => 'Withdrawal'],
             ['account' => LedgerAccount::CASH_AT_BANK, 'credit' => $amount, 'memo' => 'Payout to bank'],
         ];
 
@@ -175,7 +261,7 @@ class WalletService
         }
 
         return $this->ledger->post([
-            'type' => $fromType === MemberAccount::TYPE_WALLET
+            'type' => $from->type === MemberAccount::TYPE_WALLET
                 ? Transaction::WALLET_WITHDRAWAL
                 : Transaction::SAVINGS_WITHDRAWAL,
             'member_id' => $member->id,
@@ -183,8 +269,8 @@ class WalletService
             'amount' => $amount,
             'fee_amount' => $fee,
             'channel' => 'bank_transfer',
-            'source' => 'internal',
-            'description' => 'Withdrawal to bank account',
+            'source' => $source,
+            'description' => $description,
             'counterparty' => $beneficiary,
             'provider_reference' => $providerReference,
             'lines' => $lines,

@@ -4,7 +4,6 @@ namespace Database\Seeders;
 
 use App\Models\Permission;
 use App\Models\Role;
-use App\Models\User;
 use Illuminate\Database\Seeder;
 
 /**
@@ -154,46 +153,5 @@ class RbacSeeder extends Seeder
 
             $role->permissions()->sync($granted);
         }
-
-        $this->seedStaffAccounts();
-    }
-
-    /**
-     * Without at least one staff account the portal would be unreachable, so
-     * seed a Super Admin alongside the demo member. Credentials are printed so
-     * they can be rotated immediately after first login.
-     *
-     * A second, deliberately narrow KYC-Officer account is seeded as well. It is
-     * the clearest way to demonstrate PRD 31 in the browser: the same portal
-     * behind the same login form, but a smaller menu and every disallowed
-     * action answering 403 instead of silently succeeding.
-     */
-    protected function seedStaffAccounts(): void
-    {
-        $this->seedStaff('admin@ourmonie.test', 'OurMonie Admin', '08000000001', Role::SUPER_ADMIN);
-
-        $this->seedStaff('kyc@ourmonie.test', 'OurMonie KYC Officer', '08000000003', Role::KYC_OFFICER);
-    }
-
-    protected function seedStaff(string $email, string $name, string $phone, string $roleCode): void
-    {
-        $user = User::updateOrCreate(
-            ['email' => $email],
-            [
-                'name' => $name,
-                'phone' => $phone,
-                'password' => 'Password123!',
-                'is_admin' => true,
-                'is_active' => true,
-                'email_verified_at' => now(),
-            ],
-        );
-
-        $role = Role::where('code', $roleCode)->firstOrFail();
-
-        $user->roles()->syncWithoutDetaching([$role->id]);
-        $user->forgetPermissionGraph();
-
-        $this->command?->info("Seeded {$role->name}: {$email} / Password123!");
     }
 }
