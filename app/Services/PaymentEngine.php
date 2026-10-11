@@ -224,6 +224,18 @@ class PaymentEngine
             ];
         }
 
+        // The provider has not decided yet. The withdrawal stays in
+        // processing and the money stays held down, which is the honest
+        // state. Acknowledged rather than retried, because a later
+        // notification with its own event id will carry the outcome.
+        if ($settled === 'pending') {
+            return $this->close(
+                $event,
+                PaymentEvent::STATUS_IGNORED,
+                'Provider has not settled this transfer yet; withdrawal remains processing.'
+            );
+        }
+
         $reversal = $this->walletService->reversePayout(
             $transaction,
             'The bank did not accept this transfer, so the money was returned to your account.'
@@ -259,7 +271,7 @@ class PaymentEngine
      * describing money that did not reach the member, and acting on that is
      * recoverable where leaving it stranded is not.
      *
-     * @return string success|failed
+     * @return string success|failed|pending
      */
     private function readTransferOutcome(?string $gateway, ?string $transferCode, string $claimed, array $payload): string
     {
@@ -276,9 +288,12 @@ class PaymentEngine
                     return 'failed';
                 }
 
-                // Still pending at the provider. Nothing to settle yet - the
-                // next notification will carry the outcome.
-                return $this->normaliseOutcome($claimed, $payload);
+                // Still pending at the provider. The notification is ahead of
+                // the provider's own record, so nothing is settled either way:
+                // settling on the claim alone could complete a transfer that
+                // has not gone out, and once it is completed the reversal that
+                // would hand the money back is refused.
+                return 'pending';
             } catch (\Throwable $exception) {
                 report($exception);
             }
