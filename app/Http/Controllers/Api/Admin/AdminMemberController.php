@@ -226,6 +226,177 @@ class AdminMemberController extends Controller
     }
 
     /**
+     * PRD 32 - administrative correction of a member's own record details.
+     * Financial state is never touched here: this edits identity fields only.
+     */
+    public function update(Request $request, int $id): JsonResponse
+    {
+        $member = Member::with('user')->findOrFail($id);
+
+        $validated = $request->validate([
+            'name' => ['sometimes', 'string', 'max:120'],
+            'email' => ['sometimes', 'string', 'email:rfc', 'max:190', Rule::unique('users', 'email')->ignore($member->user_id)],
+            'phone' => ['nullable', 'string', 'max:30'],
+            'occupation' => ['nullable', 'string', 'max:100'],
+            'employer' => ['nullable', 'string', 'max:150'],
+            'job_title' => ['nullable', 'string', 'max:100'],
+            'employment_status' => ['nullable', 'string', 'max:40'],
+        ]);
+
+        $before = [
+            'name' => $member->user?->name,
+            'email' => $member->user?->email,
+            'phone' => $member->user?->phone,
+            'occupation' => $member->occupation,
+            'employer' => $member->employer,
+            'job_title' => $member->job_title,
+            'employment_status' => $member->employment_status,
+        ];
+
+        DB::transaction(function () use ($member, $validated) {
+            $userFields = array_intersect_key($validated, array_flip(['name', 'email', 'phone']));
+            if ($userFields !== [] && $member->user !== null) {
+                $member->user->forceFill($userFields)->save();
+            }
+
+            $memberFields = array_intersect_key($validated, array_flip([
+                'occupation', 'employer', 'job_title', 'employment_status',
+            ]));
+            if ($memberFields !== []) {
+                $member->forceFill($memberFields)->save();
+            }
+        });
+
+        Auditor::record(
+            'member.updated',
+            'member',
+            'Record of '.$member->member_number.' updated',
+            $before,
+            array_merge($before, $validated),
+            $member,
+        );
+
+        return response()->json([
+            'message' => 'Member record updated.',
+            'member' => $this->listPayload($member->fresh(['user', 'tier', 'accounts'])),
+        ]);
+    }
+
+    /**
+     * PRD 32 - remove a member. A member whose accounts still hold money
+     * cannot be deleted: the ledger belongs to them, and destroying the
+     * owner of a live balance would orphan the cooperative's own books.
+     *
+     * The deletion is a soft removal plus a lockout. The member row and
+     * every ledger entry pointing at it are deliberately kept (PRD 23/45 -
+     * the ledger must never be orphaned); the user simply can no longer
+     * sign in.
+     */
+    public function destroy(Request $request, int $id): JsonResponse
+    {
+        $member = Member::with('user')->findOrFail($id);
+
+        $balance = (float) $member->accounts()->sum('balance');
+
+        if ($balance > 0) {
+            return response()->json([
+                'message' => sprintf(
+                    'Cannot delete %s: ₦%s is still held across their accounts. Sweep the balances to zero first.',
+                    $member->member_number,
+                    number_format($balance, 2)
+                ),
+            ], 422);
+        }
+
+        DB::transaction(function () use ($member) {
+            $member->delete();
+
+            if ($member->user !== null) {
+                $member->user->forceFill(['is_active' => false])->save();
+                $member->user->tokens()->delete();
+            }
+        });
+
+        Auditor::record(
+            'member.deleted',
+            'member',
+            'Member '.$member->member_number.' ('.($member->user?->name ?? 'no name').') deleted',
+            ['membership_status' => $member->membership_status],
+            ['deleted' => true],
+            null,
+        );
+
+        return response()->json([
+            'message' => 'Member deleted.',
+        ]);
+    }
+
+    /**
+     * PRD 32 - bulk removal. Each member is judged on its own merits, so one
+     * member with a live balance never blocks the rest; the response reports
+     * exactly what happened to each.
+     */
+    public function bulkDestroy(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'ids' => ['required', 'array', 'min:1', 'max:200'],
+            'ids.*' => ['integer', 'exists:members,id'],
+        ]);
+
+        $deleted = 0;
+        $skipped = [];
+
+        foreach ($validated['ids'] as $id) {
+            $member = Member::with('user')->find($id);
+            if ($member === null || $member->trashed()) {
+                continue;
+            }
+
+            $balance = (float) $member->accounts()->sum('balance');
+
+            if ($balance > 0) {
+                $skipped[] = [
+                    'member_number' => $member->member_number,
+                    'name' => $member->user?->name,
+                    'reason' => sprintf('₦%s still held', number_format($balance, 2)),
+                ];
+
+                continue;
+            }
+
+            DB::transaction(function () use ($member) {
+                $member->delete();
+
+                if ($member->user !== null) {
+                    $member->user->forceFill(['is_active' => false])->save();
+                    $member->user->tokens()->delete();
+                }
+            });
+
+            Auditor::record(
+                'member.deleted',
+                'member',
+                'Member '.$member->member_number.' deleted in bulk',
+                ['membership_status' => $member->membership_status],
+                ['deleted' => true],
+                null,
+            );
+
+            $deleted++;
+        }
+
+        return response()->json([
+            'message' => sprintf(
+                '%d member(s) deleted%s.',
+                $deleted,
+                $skipped !== [] ? ', '.count($skipped).' skipped' : ''
+            ),
+            'deleted' => $deleted,
+            'skipped' => $skipped,
+        ]);
+    }
+
+    /**
      * PRD 20 - place a hold or restriction on a member account.
      */
     public function storeHold(Request $request, int $id): JsonResponse

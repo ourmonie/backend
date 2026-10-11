@@ -129,7 +129,13 @@ Route::prefix('v1')->group(function () {
                 ->middleware('permission:member.view');
             Route::get('/members/{id}', [AdminMemberController::class, 'show'])
                 ->middleware('permission:member.view');
+            Route::put('/members/{id}', [AdminMemberController::class, 'update'])
+                ->middleware('permission:member.manage');
             Route::put('/members/{id}/status', [AdminMemberController::class, 'updateStatus'])
+                ->middleware('permission:member.manage');
+            Route::post('/members/bulk-delete', [AdminMemberController::class, 'bulkDestroy'])
+                ->middleware('permission:member.manage');
+            Route::delete('/members/{id}', [AdminMemberController::class, 'destroy'])
                 ->middleware('permission:member.manage');
             Route::post('/members/{id}/holds', [AdminMemberController::class, 'storeHold'])
                 ->middleware('permission:wallet.hold');
