@@ -13,6 +13,7 @@ use App\Http\Controllers\Api\KycController;
 use App\Http\Controllers\Api\MemberDirectoryController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\PaymentWebhookController;
+use App\Http\Controllers\Api\PushController;
 use App\Http\Controllers\Api\ReferralController;
 use App\Http\Controllers\Api\RegistrationController;
 use App\Http\Controllers\Api\RewardController;
@@ -134,6 +135,16 @@ Route::prefix('v1')->group(function () {
         Route::get('/notifications', [NotificationController::class, 'index']);
         Route::post('/notifications/read', [NotificationController::class, 'markRead']);
         Route::get('/announcements', [AnnouncementController::class, 'index']);
+
+        /* ------------------------ Push notifications ---------------------- */
+
+        /* The public key is the one part of VAPID the browser needs; the
+           private half never leaves the server. A subscription is stored
+           per device so revoking one does not silence the others. */
+        Route::get('/push/public-key', [PushController::class, 'publicKey']);
+        Route::get('/push/status', [PushController::class, 'status']);
+        Route::post('/push/subscribe', [PushController::class, 'subscribe']);
+        Route::post('/push/unsubscribe', [PushController::class, 'unsubscribe']);
 
         /* ------------------------- Member KYC (18) ------------------------- */
 
