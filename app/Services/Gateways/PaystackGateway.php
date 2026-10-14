@@ -194,12 +194,15 @@ class PaystackGateway
      */
     public function listTransactions(array $parameters = []): array
     {
-        $data = $this->request('GET', '/transaction', array_merge([
+        // `request()` already unwraps the `data` envelope, and for a
+        // directory endpoint that envelope *is* the list. Reaching into it
+        // again for a nested `data` key finds nothing there, which is how
+        // this quietly reported zero transactions on a live account that
+        // had just been paid.
+        return $this->request('GET', '/transaction', array_merge([
             'perPage' => 100,
             'status' => 'success',
         ], $parameters));
-
-        return is_array($data['data'] ?? null) ? $data['data'] : [];
     }
 
     /* ---------------------------------------------------------------------- */

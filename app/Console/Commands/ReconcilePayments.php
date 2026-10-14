@@ -48,10 +48,35 @@ class ReconcilePayments extends Command
             return self::SUCCESS;
         }
 
+        $gateway = PaystackGateway::make();
         $minutes = max(5, (int) $this->option('minutes'));
 
+        // Say which account is about to be read before reporting anything
+        // about it. "No transactions found" is either an honest all-clear
+        // or a sign this run is pointed at the wrong key, and the two are
+        // indistinguishable unless the mode is on screen. The balance
+        // settles the question outright: money taken in and not yet paid
+        // out has to be sitting there, so a zero balance against a known
+        // payment means the reconciliation is looking at the wrong place.
         try {
-            $rows = PaystackGateway::make()->listTransactions([
+            $connection = $gateway->checkConnection();
+        } catch (\Throwable $exception) {
+            $this->error('Could not authenticate with Paystack: '.$exception->getMessage());
+            Log::warning('Reconciliation could not authenticate.', ['error' => $exception->getMessage()]);
+
+            return self::FAILURE;
+        }
+
+        $this->info(sprintf(
+            'Reading Paystack in %s mode. Settlement balance: %s %s.',
+            strtoupper((string) $connection['mode']),
+            $connection['currency'] ?? 'NGN',
+            $connection['balance'] ?? 'unknown'
+        ));
+        $this->newLine();
+
+        try {
+            $rows = $gateway->listTransactions([
                 'from' => now()->subMinutes($minutes)->getTimestamp(),
                 'to' => now()->getTimestamp(),
             ]);
@@ -65,7 +90,11 @@ class ReconcilePayments extends Command
         }
 
         if ($rows === []) {
-            $this->info(sprintf('Paystack reported no successful transactions in the last %d minutes.', $minutes));
+            $this->info(sprintf(
+                'Paystack reported no successful transactions in the last %d minutes.',
+                $minutes
+            ));
+            $this->line('If a payment is known to have been taken, the mode above is probably not the one it landed on.');
 
             return self::SUCCESS;
         }
