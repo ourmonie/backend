@@ -183,6 +183,25 @@ class PaystackGateway
         ];
     }
 
+    /**
+     * Recent transactions, newest first.
+     *
+     * Used for reconciliation rather than for crediting: a list is only
+     * ever a way of discovering that a reference exists. Every amount is
+     * still re-read through verifyTransaction before it becomes money.
+     *
+     * @return array<int, array>
+     */
+    public function listTransactions(array $parameters = []): array
+    {
+        $data = $this->request('GET', '/transaction', array_merge([
+            'perPage' => 100,
+            'status' => 'success',
+        ], $parameters));
+
+        return is_array($data['data'] ?? null) ? $data['data'] : [];
+    }
+
     /* ---------------------------------------------------------------------- */
     /* Transfers (payouts)                                                     */
     /* ---------------------------------------------------------------------- */
